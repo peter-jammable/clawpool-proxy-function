@@ -168,12 +168,6 @@ function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
   headers.set("Authorization", `Bearer ${resolvedToken}`);
   headers.set("Host", "api.anthropic.com");
 
-  // OAuth beta flag — required for sk-ant-oat tokens
-  const betaHeader = headers.get("anthropic-beta") || "";
-  if (!betaHeader.includes("oauth-2025-04-20")) {
-    headers.set("anthropic-beta", betaHeader ? `${betaHeader},oauth-2025-04-20` : "oauth-2025-04-20");
-  }
-
   return fetch(UPSTREAM + url.pathname + url.search, {
     method: originalRequest.method,
     headers,
