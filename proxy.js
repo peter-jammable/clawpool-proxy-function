@@ -11,7 +11,7 @@
 import { sessionId, resolveToken, resolveTokenPreferred, rotateToken } from "./auth.js";
 import { totalTokens, updateUsage, deductCredits, updatePoolUsage, updateTokenRateLimits, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
-import { incrementHourlyCounter } from "./status.js";
+import { updateStatusAudit } from "./status.js";
 import { attemptAutoRefresh } from "./stripe.js";
 
 const UPSTREAM = "https://api.anthropic.com";
@@ -24,13 +24,13 @@ export async function handleProxyRequest(request, url, env, ctx) {
 
   const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
   if (!poolUser) {
-    ctx.waitUntil(incrementHourlyCounter(false, env));
+    ctx.waitUntil(updateStatusAudit(false, env));
     return Response.json({ error: "Invalid pool key" }, { status: 401 });
   }
 
   const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, env);
   if (error) {
-    ctx.waitUntil(incrementHourlyCounter(false, env));
+    ctx.waitUntil(updateStatusAudit(false, env));
     return error;
   }
 
@@ -51,7 +51,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
 }
 
 function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey) {
-  ctx.waitUntil(incrementHourlyCounter(response.ok, env));
+  ctx.waitUntil(updateStatusAudit(response.ok, env));
 
   const rateLimits = extractRateLimits(response);
   if (rateLimits) {
