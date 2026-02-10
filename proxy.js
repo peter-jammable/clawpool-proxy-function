@@ -17,21 +17,7 @@
 
 const UPSTREAM = "https://api.anthropic.com";
 
-// ── Billable token formula ──────────────────────────────────────────
-
-/**
- * Billable tokens from a usage object.
- * Cache reads are discounted to 10% of face value (matching Anthropic's API pricing).
- * Cache creation tokens are counted at full value.
- */
-export function totalTokens(usage) {
-  return (usage.input_tokens || 0)
-    + (usage.output_tokens || 0)
-    + Math.round((usage.cache_read_tokens || 0) * 0.1)
-    + (usage.cache_creation_tokens || 0);
-}
-
-// ── Request forwarding ──────────────────────────────────────────────
+// ── Orchestration ───────────────────────────────────────────────────
 
 /**
  * Swap the pool key for the provider's OAuth token and forward to Anthropic.
@@ -62,7 +48,88 @@ export function proxyRequest(originalRequest, url, resolvedToken, bodyBytes) {
   });
 }
 
-// ── Rate-limit header parsing ───────────────────────────────────────
+/**
+ * Process an Anthropic response: extract rate limits, track streaming
+ * usage via hooks, and pipe the body back to the caller.
+ *
+ * Non-streaming responses (e.g. count_tokens preflight) pass through
+ * untouched — only SSE streams get usage tracking.
+ *
+ * hooks: {
+ *   onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
+ *   onRateLimits(tokenIndex, limits)
+ *   onRequest(success)
+ * }
+ *
+ * All hooks are optional. Each receives just enough context to do its
+ * job — the proxy never sees how they're implemented.
+ */
+export function handleResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken = false, isProviderPoolKey = false) {
+  if (hooks.onRequest) {
+    ctx.waitUntil(Promise.resolve(hooks.onRequest(response.ok)));
+  }
+
+  // Capture rate-limit headers from every response (including errors)
+  const rateLimits = extractRateLimits(response);
+  if (rateLimits && hooks.onRateLimits) {
+    ctx.waitUntil(Promise.resolve(hooks.onRateLimits(tokenIndex, rateLimits)));
+  }
+
+  if (!response.ok) {
+    return new Response(response.body, {
+      status: response.status,
+      headers: response.headers,
+    });
+  }
+
+  // Non-streaming (e.g. count_tokens preflight) — pass through untouched
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    return new Response(response.body, {
+      status: response.status,
+      headers: response.headers,
+    });
+  }
+
+  // Streaming: pipe through usage-tracking transform
+  let usageResolve;
+  const usagePromise = new Promise((resolve) => {
+    usageResolve = resolve;
+  });
+
+  const trackingStream = createUsageTrackingStream((usage) => {
+    usageResolve(usage);
+  });
+
+  const trackedBody = response.body.pipeThrough(trackingStream);
+
+  if (hooks.onUsage) {
+    ctx.waitUntil(
+      usagePromise.then((usage) =>
+        hooks.onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
+      )
+    );
+  }
+
+  return new Response(trackedBody, {
+    status: response.status,
+    headers: response.headers,
+  });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Billable tokens from a usage object.
+ * Cache reads are discounted to 10% of face value (matching Anthropic's API pricing).
+ * Cache creation tokens are counted at full value.
+ */
+export function totalTokens(usage) {
+  return (usage.input_tokens || 0)
+    + (usage.output_tokens || 0)
+    + Math.round((usage.cache_read_tokens || 0) * 0.1)
+    + (usage.cache_creation_tokens || 0);
+}
 
 /**
  * Extract Anthropic's unified rate-limit headers from a response.
@@ -101,8 +168,6 @@ export function extractRateLimits(response) {
 
   return Object.keys(limits).length > 0 ? limits : null;
 }
-
-// ── SSE stream usage tracking ───────────────────────────────────────
 
 /**
  * Create a TransformStream that passes SSE data through unchanged
@@ -168,118 +233,5 @@ export function createUsageTrackingStream(onUsage) {
         cache_creation_tokens: cacheCreationTokens,
       });
     },
-  });
-}
-
-// ── JSON response usage extraction ──────────────────────────────────
-
-/**
- * Extract usage from a non-streaming JSON response body.
- * Returns { input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens }
- * or null if no usage field is present.
- */
-export function extractUsageFromJson(body) {
-  try {
-    const data = JSON.parse(body);
-    if (data.usage) {
-      return {
-        input_tokens: data.usage.input_tokens || 0,
-        output_tokens: data.usage.output_tokens || 0,
-        cache_read_tokens: data.usage.cache_read_input_tokens || 0,
-        cache_creation_tokens: data.usage.cache_creation_input_tokens || 0,
-      };
-    }
-  } catch {}
-  return null;
-}
-
-// ── Response handling ───────────────────────────────────────────────
-
-/**
- * Process an Anthropic response: extract rate limits, track usage via
- * hooks, and stream the body back to the caller.
- *
- * hooks: {
- *   onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
- *   onRateLimits(tokenIndex, limits)
- *   onRequest(success)
- * }
- *
- * All hooks are optional. Each receives just enough context to do its
- * job — the proxy never sees how they're implemented.
- */
-export function handleResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken = false, isProviderPoolKey = false) {
-  if (hooks.onRequest) {
-    ctx.waitUntil(Promise.resolve(hooks.onRequest(response.ok)));
-  }
-
-  const contentType = response.headers.get("content-type") || "";
-  const isStreaming = contentType.includes("text/event-stream");
-
-  // Capture rate-limit headers from every response (including errors)
-  const rateLimits = extractRateLimits(response);
-  if (rateLimits && hooks.onRateLimits) {
-    ctx.waitUntil(Promise.resolve(hooks.onRateLimits(tokenIndex, rateLimits)));
-  }
-
-  if (!response.ok) {
-    return new Response(response.body, {
-      status: response.status,
-      headers: response.headers,
-    });
-  }
-
-  if (isStreaming) {
-    return handleStreamingResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken, isProviderPoolKey);
-  } else {
-    return handleJsonResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken, isProviderPoolKey);
-  }
-}
-
-// ── Internal: streaming response ────────────────────────────────────
-
-function handleStreamingResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken, isProviderPoolKey) {
-  let usageResolve;
-  const usagePromise = new Promise((resolve) => {
-    usageResolve = resolve;
-  });
-
-  const trackingStream = createUsageTrackingStream((usage) => {
-    usageResolve(usage);
-  });
-
-  const trackedBody = response.body.pipeThrough(trackingStream);
-
-  if (hooks.onUsage) {
-    ctx.waitUntil(
-      usagePromise.then((usage) =>
-        hooks.onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
-      )
-    );
-  }
-
-  return new Response(trackedBody, {
-    status: response.status,
-    headers: response.headers,
-  });
-}
-
-// ── Internal: JSON response ─────────────────────────────────────────
-
-async function handleJsonResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken, isProviderPoolKey) {
-  const body = await response.text();
-  const usage = extractUsageFromJson(body);
-
-  if (usage && hooks.onUsage) {
-    ctx.waitUntil(
-      Promise.resolve(
-        hooks.onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
-      )
-    );
-  }
-
-  return new Response(body, {
-    status: response.status,
-    headers: response.headers,
   });
 }
