@@ -151,6 +151,11 @@ function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
   headers.set("Authorization", `Bearer ${resolvedToken}`);
   headers.set("Host", "api.anthropic.com");
 
+  const beta = headers.get("anthropic-beta") || "";
+  if (!beta.includes("oauth-2025-04-20")) {
+    headers.set("anthropic-beta", beta ? `${beta},oauth-2025-04-20` : "oauth-2025-04-20");
+  }
+
   return fetch(UPSTREAM + url.pathname + url.search, {
     method: originalRequest.method,
     headers,
