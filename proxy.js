@@ -117,14 +117,9 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
     ctx.waitUntil(updateTokenRateLimits(tokenIndex, rateLimits, env));
   }
 
-  if (!response.ok) {
-    return new Response(response.body, { status: response.status, headers: response.headers });
-  }
-
-  // Non-streaming (e.g. count_tokens preflight) — pass through untouched
   const contentType = response.headers.get("content-type") || "";
-  if (!contentType.includes("text/event-stream")) {
-    return new Response(response.body, { status: response.status, headers: response.headers });
+  if (!response.ok || !contentType.includes("text/event-stream")) {
+    return response;
   }
 
   // Streaming: pipe through usage-tracking transform
