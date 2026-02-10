@@ -1,47 +1,199 @@
 /**
- * ClawPool edge proxy — public, auditable request forwarding.
+ * ClawPool edge proxy — the actual deployed code that handles every
+ * API request through proxy.clawpool.ai.
  *
- * This file is published to a public repository so anyone can verify
- * exactly what happens to their API requests. It contains:
- *   - Auth swap (pool key → provider OAuth token)
- *   - Request forwarding to api.anthropic.com
- *   - SSE stream passthrough with token-count extraction
- *   - Rate-limit header parsing
- *   - Billable token formula (cache reads at 10%)
+ * This file is published to a public repo so you can see exactly what
+ * happens to your requests. The imports reference private modules that
+ * aren't included — you can read the full flow, but can't run it in
+ * isolation.
  *
- * All pool management, billing, and storage happen through the `hooks`
- * callback — this file never touches KV, Stripe, or any private state.
- *
- * Zero imports. Fully self-contained.
+ * Source: https://github.com/peter-jammable/clawpool-proxy-function
  */
+
+// ── Private modules (not in public repo) ────────────────────────────
+
+import { sessionId, resolveToken, resolveTokenPreferred, rotateToken } from "./auth.js";
+import { totalTokens, updateUsage, deductCredits, updatePoolUsage, updateTokenRateLimits, checkUsageThresholds } from "./usage.js";
+import { recordUsage } from "./ledger.js";
+import { incrementHourlyCounter } from "./status.js";
+import { attemptAutoTopup } from "./stripe.js";
 
 const UPSTREAM = "https://api.anthropic.com";
 
-// ── Orchestration ───────────────────────────────────────────────────
+// ── Entry point (called by worker.js router) ────────────────────────
+
+export async function handleProxyRequest(request, url, env, ctx) {
+
+  // Authenticate: pool key → consumer record
+  const apiKey = extractPoolKey(request.headers.get("authorization"))
+    || request.headers.get("x-api-key")
+    || "";
+
+  const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
+  if (!poolUser) {
+    ctx.waitUntil(incrementHourlyCounter(false, env));
+    return errorResponse(401, "Invalid pool key");
+  }
+
+  // Enforce token allowance (consumers only, not provider keys)
+  const isProviderPoolKey = poolUser.provider_key === true;
+  const tokenLimit = poolUser.plan_tokens || 0;
+  const tokensUsed = poolUser.tokens_used_period || 0;
+  const subscriptionExhausted = tokenLimit > 0 && tokensUsed >= tokenLimit;
+
+  if (subscriptionExhausted && !isProviderPoolKey) {
+    if (poolUser.auto_topup_enabled) {
+      const topupResult = await attemptAutoTopup(apiKey, poolUser, env);
+      if (!topupResult.success) {
+        ctx.waitUntil(incrementHourlyCounter(false, env));
+        return errorResponse(429,
+          `Auto top-up failed: ${topupResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
+          { tokens_used: tokensUsed, token_limit: tokenLimit },
+        );
+      }
+    } else {
+      ctx.waitUntil(incrementHourlyCounter(false, env));
+      return errorResponse(429,
+        "You've used all your tokens this period. Enable auto top-up ($8 for 4M tokens) or wait for your next billing cycle. https://clawpool.ai/dashboard",
+        { tokens_used: tokensUsed, token_limit: tokenLimit },
+      );
+    }
+  }
+
+  // Resolve a provider token: prefer own tokens, fall back to pool
+  const ownerTokenIndices = poolUser.owner_token_indices || [];
+  let resolved = null;
+  let isOwnToken = false;
+
+  if (ownerTokenIndices.length > 0) {
+    resolved = await resolveTokenPreferred(ownerTokenIndices, env);
+    if (resolved) isOwnToken = true;
+  }
+
+  const canUsePool = !isProviderPoolKey || (tokenLimit > 0 && !subscriptionExhausted);
+  if (!resolved && canUsePool) {
+    resolved = await resolveToken(await sessionId(apiKey), env);
+  }
+
+  if (!resolved) {
+    ctx.waitUntil(incrementHourlyCounter(false, env));
+    return new Response(
+      JSON.stringify({ type: "error", error: { type: "overloaded_error",
+        message: isProviderPoolKey
+          ? "Your token is at capacity or disabled. Wait for the rate limit to reset or add another token."
+          : "No tokens available in the pool. All provider tokens are at capacity or disabled.",
+      }}),
+      { status: 529, headers: { "Content-Type": "application/json", "Retry-After": "300" } },
+    );
+  }
+
+  // Forward to Anthropic
+  const bodyBytes = request.body ? await request.arrayBuffer() : null;
+  const preparedRequest = injectOAuthBetaFlag(request);
+  let response = await forwardToAnthropic(preparedRequest, url, resolved.token.oauth_token, bodyBytes);
+
+  // On auth/rate error, try a fallback token
+  if (response.status === 401 || response.status === 403 || response.status === 429) {
+    const fallback = isOwnToken
+      ? await resolveToken(await sessionId(apiKey), env)
+      : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
+    if (fallback) {
+      response = await forwardToAnthropic(preparedRequest, url, fallback.token.oauth_token, bodyBytes);
+      return handleResponse(response, fallback.tokenIndex, apiKey, env, ctx, false, false);
+    }
+  }
+
+  return handleResponse(response, resolved.tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey);
+}
+
+// ── Response handling ───────────────────────────────────────────────
+
+function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey) {
+  ctx.waitUntil(incrementHourlyCounter(response.ok, env));
+
+  // Capture rate-limit headers from every response (including errors)
+  const rateLimits = extractRateLimits(response);
+  if (rateLimits) {
+    ctx.waitUntil(updateTokenRateLimits(tokenIndex, rateLimits, env));
+  }
+
+  if (!response.ok) {
+    return new Response(response.body, { status: response.status, headers: response.headers });
+  }
+
+  // Non-streaming (e.g. count_tokens preflight) — pass through untouched
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    return new Response(response.body, { status: response.status, headers: response.headers });
+  }
+
+  // Streaming: pipe through usage-tracking transform
+  let usageResolve;
+  const usagePromise = new Promise((resolve) => { usageResolve = resolve; });
+  const trackedBody = response.body.pipeThrough(createUsageTrackingStream((usage) => usageResolve(usage)));
+
+  ctx.waitUntil(
+    usagePromise.then(async (usage) => {
+      await Promise.all([
+        updateUsage(tokenIndex, usage, env),
+        updateTokenRateLimits(tokenIndex, null, env, usage),
+        ...(!isOwnToken ? [
+          deductCredits(apiKey, usage, env),
+          recordUsage(apiKey, tokenIndex, usage, env),
+          updatePoolUsage(tokenIndex, usage, env),
+        ] : isProviderPoolKey ? [
+          deductCredits(apiKey, usage, env),
+        ] : []),
+      ]);
+      if (!isOwnToken) {
+        await checkUsageThresholds(apiKey, env).catch(() => {});
+      }
+    })
+  );
+
+  return new Response(trackedBody, { status: response.status, headers: response.headers });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/** Extract pool key from Authorization: Bearer <key> header. */
+function extractPoolKey(authHeader) {
+  if (!authHeader) return null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : null;
+}
+
+/** JSON error response. */
+function errorResponse(status, message, extra = {}) {
+  return new Response(
+    JSON.stringify({ error: message, ...extra }),
+    { status, headers: { "Content-Type": "application/json" } },
+  );
+}
 
 /**
- * Swap the pool key for the provider's OAuth token and forward to Anthropic.
- *
- * Callers are responsible for any header mutations (e.g. beta flags)
- * before passing the request here.
- *
- * @param {Request}     originalRequest - incoming request (headers are cloned, not mutated)
- * @param {URL}         url             - parsed request URL (pathname + search are forwarded)
- * @param {string}      resolvedToken   - provider OAuth token (sk-ant-oat-…)
- * @param {ArrayBuffer} bodyBytes       - pre-read request body (or null)
- * @returns {Promise<Response>}
+ * Inject the OAuth beta flag required for sk-ant-oat tokens.
+ * Returns a new Request with the modified header (original is not mutated).
  */
-export function proxyRequest(originalRequest, url, resolvedToken, bodyBytes) {
-  const headers = new Headers(originalRequest.headers);
+function injectOAuthBetaFlag(request) {
+  const betaHeader = request.headers.get("anthropic-beta") || "";
+  if (betaHeader.includes("oauth-2025-04-20")) return request;
+  const modifiedHeaders = new Headers(request.headers);
+  modifiedHeaders.set("anthropic-beta", betaHeader ? `${betaHeader},oauth-2025-04-20` : "oauth-2025-04-20");
+  return new Request(request, { headers: modifiedHeaders });
+}
 
-  // Auth swap: replace consumer's pool key with provider's OAuth token
+/**
+ * Auth swap (pool key → provider OAuth token) and forward to Anthropic.
+ * Headers are cloned — the original request is not mutated.
+ */
+function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
+  const headers = new Headers(originalRequest.headers);
   headers.delete("x-api-key");
   headers.set("Authorization", `Bearer ${resolvedToken}`);
   headers.set("Host", "api.anthropic.com");
 
-  const upstreamUrl = UPSTREAM + url.pathname + url.search;
-
-  return fetch(upstreamUrl, {
+  return fetch(UPSTREAM + url.pathname + url.search, {
     method: originalRequest.method,
     headers,
     body: bodyBytes,
@@ -49,93 +201,10 @@ export function proxyRequest(originalRequest, url, resolvedToken, bodyBytes) {
 }
 
 /**
- * Process an Anthropic response: extract rate limits, track streaming
- * usage via hooks, and pipe the body back to the caller.
- *
- * Non-streaming responses (e.g. count_tokens preflight) pass through
- * untouched — only SSE streams get usage tracking.
- *
- * hooks: {
- *   onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
- *   onRateLimits(tokenIndex, limits)
- *   onRequest(success)
- * }
- *
- * All hooks are optional. Each receives just enough context to do its
- * job — the proxy never sees how they're implemented.
- */
-export function handleResponse(response, tokenIndex, apiKey, hooks, ctx, isOwnToken = false, isProviderPoolKey = false) {
-  if (hooks.onRequest) {
-    ctx.waitUntil(Promise.resolve(hooks.onRequest(response.ok)));
-  }
-
-  // Capture rate-limit headers from every response (including errors)
-  const rateLimits = extractRateLimits(response);
-  if (rateLimits && hooks.onRateLimits) {
-    ctx.waitUntil(Promise.resolve(hooks.onRateLimits(tokenIndex, rateLimits)));
-  }
-
-  if (!response.ok) {
-    return new Response(response.body, {
-      status: response.status,
-      headers: response.headers,
-    });
-  }
-
-  // Non-streaming (e.g. count_tokens preflight) — pass through untouched
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.includes("text/event-stream")) {
-    return new Response(response.body, {
-      status: response.status,
-      headers: response.headers,
-    });
-  }
-
-  // Streaming: pipe through usage-tracking transform
-  let usageResolve;
-  const usagePromise = new Promise((resolve) => {
-    usageResolve = resolve;
-  });
-
-  const trackingStream = createUsageTrackingStream((usage) => {
-    usageResolve(usage);
-  });
-
-  const trackedBody = response.body.pipeThrough(trackingStream);
-
-  if (hooks.onUsage) {
-    ctx.waitUntil(
-      usagePromise.then((usage) =>
-        hooks.onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
-      )
-    );
-  }
-
-  return new Response(trackedBody, {
-    status: response.status,
-    headers: response.headers,
-  });
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-/**
- * Billable tokens from a usage object.
- * Cache reads are discounted to 10% of face value (matching Anthropic's API pricing).
- * Cache creation tokens are counted at full value.
- */
-export function totalTokens(usage) {
-  return (usage.input_tokens || 0)
-    + (usage.output_tokens || 0)
-    + Math.round((usage.cache_read_tokens || 0) * 0.1)
-    + (usage.cache_creation_tokens || 0);
-}
-
-/**
  * Extract Anthropic's unified rate-limit headers from a response.
  * Returns an object with parsed values, or null if no headers are present.
  */
-export function extractRateLimits(response) {
+function extractRateLimits(response) {
   const limits = {};
 
   const fiveHourUtilization = response.headers.get("anthropic-ratelimit-unified-5h-utilization");
@@ -170,13 +239,11 @@ export function extractRateLimits(response) {
 }
 
 /**
- * Create a TransformStream that passes SSE data through unchanged
- * while extracting token counts from message_start and message_delta events.
- *
- * When the stream ends, calls onUsage({ input_tokens, output_tokens,
- * cache_read_tokens, cache_creation_tokens }).
+ * TransformStream that passes SSE data through unchanged while extracting
+ * token counts from message_start and message_delta events.
+ * On stream end, calls onUsage({ input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens }).
  */
-export function createUsageTrackingStream(onUsage) {
+function createUsageTrackingStream(onUsage) {
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;

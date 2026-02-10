@@ -1,33 +1,31 @@
 # ClawPool Proxy Function
 
-This is the edge proxy that sits between your API client and Anthropic. It's published here so you can see exactly what happens to your requests.
+This is the actual deployed code that handles every API request through `proxy.clawpool.ai`. It's published here so you can see exactly what happens to your requests.
 
-## What this file does
+## What this code does
 
-1. **Auth swap** — Your pool key is replaced with a provider's OAuth token
-2. **Forward** — The request is sent to `api.anthropic.com` with the swapped credentials
-3. **Stream passthrough** — SSE responses are piped through unchanged while token counts are extracted from `message_start` and `message_delta` events
-4. **Rate-limit parsing** — Anthropic's `anthropic-ratelimit-unified-*` headers are extracted and passed to a callback
-5. **Billing formula** — Cache read tokens are discounted to 10% of face value (matching Anthropic's API pricing); everything else at 100%
+Read `proxy.js` top to bottom — it's the full lifecycle of a proxied request:
 
-Non-streaming responses (like `count_tokens` preflight checks) pass through untouched with no usage tracking.
+1. **Authenticate** — Your pool key is looked up in KV to find your consumer record
+2. **Enforce limits** — Check token allowance, attempt auto top-up if exhausted
+3. **Resolve token** — Pick a provider's OAuth token (prefer your own, fall back to pool)
+4. **Forward** — Auth swap (your pool key for the provider's token) and send to `api.anthropic.com`
+5. **Retry on error** — On 401/403/429, try a fallback token
+6. **Stream back** — SSE responses are piped through unchanged while token counts are extracted
+7. **Bill** — `deductCredits`, `recordUsage`, `updatePoolUsage` run async after the response streams
 
-## What this file does NOT do
+## What's not here
 
-All pool management, billing, storage, and auth plumbing live in the private repo. This file has zero imports and never touches KV, Stripe, or any private state.
+The imports at the top of `proxy.js` reference private modules that aren't in this repo:
 
-Private operations are wired in through a `hooks` callback:
+- `auth.js` — Token resolution, rotation, sticky sessions
+- `usage.js` — KV counter updates, credit deduction, rate-limit storage
+- `ledger.js` — Revenue recording, provider earnings
+- `status.js` — Request counters for the status page
+- `stripe.js` — Auto top-up payment processing
 
-```js
-hooks: {
-  onUsage(tokenIndex, apiKey, usage, isOwnToken, isProviderPoolKey)
-  onRateLimits(tokenIndex, limits)
-  onRequest(success)
-}
-```
-
-The hooks show *that* billing and tracking happen, but not *how*.
+You can see exactly *which* functions are called and *when*, but not their implementation. The function names tell you what they do — `deductCredits`, `recordUsage`, `updatePoolUsage` — there's nothing hidden.
 
 ## Source
 
-This file is synced from the [ClawPool](https://clawpool.ai) private repo. It runs as a Cloudflare Worker at `proxy.clawpool.ai`.
+This file is synced from the [ClawPool](https://clawpool.ai) private repo via `just publish-proxy`. It runs as a Cloudflare Worker.
