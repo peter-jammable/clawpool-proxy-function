@@ -2,6 +2,14 @@
 
 This is the actual deployed code that handles every API request through `proxy.clawpool.ai`. It's published here so you can see exactly what happens to your requests.
 
+## Quick start
+
+```bash
+export ANTHROPIC_BASE_URL=https://proxy.clawpool.ai
+export ANTHROPIC_AUTH_TOKEN=sk-ant-cpk-...   # your pool key
+claude
+```
+
 ## What this code does
 
 Read `proxy.js` top to bottom — it's the full lifecycle of a proxied request:
@@ -14,18 +22,10 @@ Read `proxy.js` top to bottom — it's the full lifecycle of a proxied request:
 6. **Stream back** — SSE responses are piped through unchanged while token counts are extracted
 7. **Bill** — `deductCredits`, `recordUsage`, `updatePoolUsage` run async after the response streams
 
-## What's not here
+Nothing is stored. Nothing is logged. The proxy is a passthrough — your request goes in, Claude's response comes back, and token counts are extracted from the SSE stream for billing.
 
-The imports at the top of `proxy.js` reference private modules that aren't in this repo:
+## Verifiability
 
-- `auth.js` — Token resolution, rotation, sticky sessions
-- `usage.js` — KV counter updates, credit deduction, rate-limit storage
-- `ledger.js` — Revenue recording, provider earnings
-- `status.js` — Request counters for the status page
-- `stripe.js` — Auto refresh payment processing
+Every production deploy creates a timestamped git tag in this repo (e.g. `deploy-20260210-143022`). Each commit message includes the source repo's commit SHA. You can compare any tagged version here to what's running on `proxy.clawpool.ai`.
 
-You can see exactly *which* functions are called and *when*, but not their implementation. The function names tell you what they do — `deductCredits`, `recordUsage`, `updatePoolUsage` — there's nothing hidden.
-
-## Source
-
-This file is synced from the [ClawPool](https://clawpool.ai) private repo via `just publish-proxy`. It runs as a Cloudflare Worker.
+This file is synced automatically on every `just release` from the ClawPool private repo. It runs as a Cloudflare Worker.
