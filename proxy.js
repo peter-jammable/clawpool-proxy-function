@@ -96,10 +96,10 @@ async function resolveAuthorizedToken(apiKey, poolUser, env) {
 
   if (subscriptionExhausted && !isProviderPoolKey) {
     if (poolUser.auto_refresh_enabled) {
-      const topupResult = await attemptAutoRefresh(apiKey, poolUser, env);
-      if (!topupResult.success) {
+      const refreshResult = await attemptAutoRefresh(apiKey, poolUser, env);
+      if (!refreshResult.success) {
         return { error: Response.json({
-          error: `Auto refresh failed: ${topupResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
+          error: `Auto refresh failed: ${refreshResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
           tokens_used: tokensUsed, token_limit: tokenLimit,
         }, { status: 429 }) };
       }

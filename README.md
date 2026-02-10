@@ -7,7 +7,7 @@ This is the actual deployed code that handles every API request through `proxy.c
 Read `proxy.js` top to bottom — it's the full lifecycle of a proxied request:
 
 1. **Authenticate** — Your pool key is looked up in KV to find your consumer record
-2. **Enforce limits** — Check token allowance, attempt auto top-up if exhausted
+2. **Enforce limits** — Check token allowance, attempt auto refresh if exhausted
 3. **Resolve token** — Pick a provider's OAuth token (prefer your own, fall back to pool)
 4. **Forward** — Auth swap (your pool key for the provider's token) and send to `api.anthropic.com`
 5. **Retry on error** — On 401/403/429, try a fallback token
@@ -22,7 +22,7 @@ The imports at the top of `proxy.js` reference private modules that aren't in th
 - `usage.js` — KV counter updates, credit deduction, rate-limit storage
 - `ledger.js` — Revenue recording, provider earnings
 - `status.js` — Request counters for the status page
-- `stripe.js` — Auto top-up payment processing
+- `stripe.js` — Auto refresh payment processing
 
 You can see exactly *which* functions are called and *when*, but not their implementation. The function names tell you what they do — `deductCredits`, `recordUsage`, `updatePoolUsage` — there's nothing hidden.
 
