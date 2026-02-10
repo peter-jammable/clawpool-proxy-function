@@ -24,13 +24,12 @@ export async function handleProxyRequest(request, url, env, ctx) {
 
   const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
   if (!poolUser) {
-    ctx.waitUntil(updateStatusAudit(false, env));
     return Response.json({ error: "Invalid pool key" }, { status: 401 });
   }
 
   const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, env);
   if (error) {
-    ctx.waitUntil(updateStatusAudit(false, env));
+    if (error.status === 529) ctx.waitUntil(updateStatusAudit(false, env));
     return error;
   }
 
