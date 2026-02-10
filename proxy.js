@@ -32,7 +32,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
   const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
   if (!poolUser) {
     ctx.waitUntil(incrementHourlyCounter(false, env));
-    return errorResponse(401, "Invalid pool key");
+    return Response.json({ error: "Invalid pool key" }, { status: 401 });
   }
 
   // Enforce token allowance (consumers only, not provider keys)
@@ -46,17 +46,17 @@ export async function handleProxyRequest(request, url, env, ctx) {
       const topupResult = await attemptAutoTopup(apiKey, poolUser, env);
       if (!topupResult.success) {
         ctx.waitUntil(incrementHourlyCounter(false, env));
-        return errorResponse(429,
-          `Auto top-up failed: ${topupResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
-          { tokens_used: tokensUsed, token_limit: tokenLimit },
-        );
+        return Response.json({
+          error: `Auto top-up failed: ${topupResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
+          tokens_used: tokensUsed, token_limit: tokenLimit,
+        }, { status: 429 });
       }
     } else {
       ctx.waitUntil(incrementHourlyCounter(false, env));
-      return errorResponse(429,
-        "You've used all your tokens this period. Enable auto top-up ($8 for 4M tokens) or wait for your next billing cycle. https://clawpool.ai/dashboard",
-        { tokens_used: tokensUsed, token_limit: tokenLimit },
-      );
+      return Response.json({
+        error: "You've used all your tokens this period. Enable auto top-up ($8 for 4M tokens) or wait for your next billing cycle. https://clawpool.ai/dashboard",
+        tokens_used: tokensUsed, token_limit: tokenLimit,
+      }, { status: 429 });
     }
   }
 
@@ -89,8 +89,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
 
   // Forward to Anthropic
   const bodyBytes = request.body ? await request.arrayBuffer() : null;
-  const preparedRequest = injectOAuthBetaFlag(request);
-  let response = await forwardToAnthropic(preparedRequest, url, resolved.token.oauth_token, bodyBytes);
+  let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes);
 
   // On auth/rate error, try a fallback token
   if (response.status === 401 || response.status === 403 || response.status === 429) {
@@ -98,7 +97,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
       ? await resolveToken(await sessionId(apiKey), env)
       : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
     if (fallback) {
-      response = await forwardToAnthropic(preparedRequest, url, fallback.token.oauth_token, bodyBytes);
+      response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes);
       return handleResponse(response, fallback.tokenIndex, apiKey, env, ctx, false, false);
     }
   }
@@ -158,28 +157,9 @@ function extractPoolKey(authHeader) {
   return match ? match[1] : null;
 }
 
-/** JSON error response. */
-function errorResponse(status, message, extra = {}) {
-  return new Response(
-    JSON.stringify({ error: message, ...extra }),
-    { status, headers: { "Content-Type": "application/json" } },
-  );
-}
-
-/**
- * Inject the OAuth beta flag required for sk-ant-oat tokens.
- * Returns a new Request with the modified header (original is not mutated).
- */
-function injectOAuthBetaFlag(request) {
-  const betaHeader = request.headers.get("anthropic-beta") || "";
-  if (betaHeader.includes("oauth-2025-04-20")) return request;
-  const modifiedHeaders = new Headers(request.headers);
-  modifiedHeaders.set("anthropic-beta", betaHeader ? `${betaHeader},oauth-2025-04-20` : "oauth-2025-04-20");
-  return new Request(request, { headers: modifiedHeaders });
-}
-
 /**
  * Auth swap (pool key → provider OAuth token) and forward to Anthropic.
+ * Also injects the OAuth beta flag required for sk-ant-oat tokens.
  * Headers are cloned — the original request is not mutated.
  */
 function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
@@ -187,6 +167,12 @@ function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
   headers.delete("x-api-key");
   headers.set("Authorization", `Bearer ${resolvedToken}`);
   headers.set("Host", "api.anthropic.com");
+
+  // OAuth beta flag — required for sk-ant-oat tokens
+  const betaHeader = headers.get("anthropic-beta") || "";
+  if (!betaHeader.includes("oauth-2025-04-20")) {
+    headers.set("anthropic-beta", betaHeader ? `${betaHeader},oauth-2025-04-20` : "oauth-2025-04-20");
+  }
 
   return fetch(UPSTREAM + url.pathname + url.search, {
     method: originalRequest.method,
