@@ -23,9 +23,3 @@ Read `proxy.js` top to bottom — it's the full lifecycle of a proxied request:
 7. **Bill** — `deductCredits`, `recordUsage`, `updatePoolUsage` run async after the response streams
 
 Nothing is stored. Nothing is logged. The proxy is a passthrough — your request goes in, Claude's response comes back, and token counts are extracted from the SSE stream for billing.
-
-## Verifiability
-
-Every production deploy creates a timestamped git tag in this repo (e.g. `deploy-20260210-143022`). Each commit message includes the source repo's commit SHA. You can compare any tagged version here to what's running on `proxy.clawpool.ai`.
-
-This file is synced automatically on every `just release` from the ClawPool private repo. It runs as a Cloudflare Worker.
