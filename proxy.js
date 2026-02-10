@@ -24,7 +24,6 @@ const UPSTREAM = "https://api.anthropic.com";
 
 export async function handleProxyRequest(request, url, env, ctx) {
 
-  // Authenticate: pool key → consumer record
   const apiKey = extractPoolKey(request.headers.get("authorization"))
     || request.headers.get("x-api-key")
     || "";
@@ -35,7 +34,6 @@ export async function handleProxyRequest(request, url, env, ctx) {
     return Response.json({ error: "Invalid pool key" }, { status: 401 });
   }
 
-  // Enforce token allowance (consumers only, not provider keys)
   const isProviderPoolKey = poolUser.provider_key === true;
   const tokenLimit = poolUser.plan_tokens || 0;
   const tokensUsed = poolUser.tokens_used_period || 0;
@@ -60,7 +58,6 @@ export async function handleProxyRequest(request, url, env, ctx) {
     }
   }
 
-  // Resolve a provider token: prefer own tokens, fall back to pool
   const ownerTokenIndices = poolUser.owner_token_indices || [];
   let resolved = null;
   let isOwnToken = false;
@@ -87,11 +84,9 @@ export async function handleProxyRequest(request, url, env, ctx) {
     );
   }
 
-  // Forward to Anthropic
   const bodyBytes = request.body ? await request.arrayBuffer() : null;
   let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes);
 
-  // On auth/rate error, try a fallback token
   if (response.status === 401 || response.status === 403 || response.status === 429) {
     const fallback = isOwnToken
       ? await resolveToken(await sessionId(apiKey), env)
@@ -105,12 +100,9 @@ export async function handleProxyRequest(request, url, env, ctx) {
   return handleResponse(response, resolved.tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey);
 }
 
-// ── Response handling ───────────────────────────────────────────────
-
 function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey) {
   ctx.waitUntil(incrementHourlyCounter(response.ok, env));
 
-  // Capture rate-limit headers from every response (including errors)
   const rateLimits = extractRateLimits(response);
   if (rateLimits) {
     ctx.waitUntil(updateTokenRateLimits(tokenIndex, rateLimits, env));
@@ -121,7 +113,6 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
     return response;
   }
 
-  // Streaming: pipe through usage-tracking transform
   let usageResolve;
   const usagePromise = new Promise((resolve) => { usageResolve = resolve; });
   const trackedBody = response.body.pipeThrough(createUsageTrackingStream((usage) => usageResolve(usage)));
@@ -148,16 +139,12 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
   return new Response(trackedBody, { status: response.status, headers: response.headers });
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
-/** Extract pool key from Authorization: Bearer <key> header. */
 function extractPoolKey(authHeader) {
   if (!authHeader) return null;
   const match = authHeader.match(/^Bearer\s+(.+)$/i);
   return match ? match[1] : null;
 }
 
-/** Auth swap (pool key → provider OAuth token) and forward to Anthropic. */
 function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
   const headers = new Headers(originalRequest.headers);
   headers.delete("x-api-key");
@@ -171,10 +158,6 @@ function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
   });
 }
 
-/**
- * Extract Anthropic's unified rate-limit headers from a response.
- * Returns an object with parsed values, or null if no headers are present.
- */
 function extractRateLimits(response) {
   const limits = {};
 
@@ -209,11 +192,6 @@ function extractRateLimits(response) {
   return Object.keys(limits).length > 0 ? limits : null;
 }
 
-/**
- * TransformStream that passes SSE data through unchanged while extracting
- * token counts from message_start and message_delta events.
- * On stream end, calls onUsage({ input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens }).
- */
 function createUsageTrackingStream(onUsage) {
   let inputTokens = 0;
   let outputTokens = 0;
