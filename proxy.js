@@ -8,17 +8,13 @@
  * isolation.
  */
 
-// ── Private modules (not in public repo) ────────────────────────────
-
 import { sessionId, resolveToken, resolveTokenPreferred, rotateToken } from "./auth.js";
 import { totalTokens, updateUsage, deductCredits, updatePoolUsage, updateTokenRateLimits, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { incrementHourlyCounter } from "./status.js";
-import { attemptAutoTopup } from "./stripe.js";
+import { attemptAutoRefresh } from "./stripe.js";
 
 const UPSTREAM = "https://api.anthropic.com";
-
-// ── Entry point (called by worker.js router) ────────────────────────
 
 export async function handleProxyRequest(request, url, env, ctx) {
 
@@ -32,54 +28,10 @@ export async function handleProxyRequest(request, url, env, ctx) {
     return Response.json({ error: "Invalid pool key" }, { status: 401 });
   }
 
-  const isProviderPoolKey = poolUser.provider_key === true;
-  const tokenLimit = poolUser.plan_tokens || 0;
-  const tokensUsed = poolUser.tokens_used_period || 0;
-  const subscriptionExhausted = tokenLimit > 0 && tokensUsed >= tokenLimit;
-
-  if (subscriptionExhausted && !isProviderPoolKey) {
-    if (poolUser.auto_topup_enabled) {
-      const topupResult = await attemptAutoTopup(apiKey, poolUser, env);
-      if (!topupResult.success) {
-        ctx.waitUntil(incrementHourlyCounter(false, env));
-        return Response.json({
-          error: `Auto top-up failed: ${topupResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
-          tokens_used: tokensUsed, token_limit: tokenLimit,
-        }, { status: 429 });
-      }
-    } else {
-      ctx.waitUntil(incrementHourlyCounter(false, env));
-      return Response.json({
-        error: "You've used all your tokens this period. Enable auto top-up ($8 for 4M tokens) or wait for your next billing cycle. https://clawpool.ai/dashboard",
-        tokens_used: tokensUsed, token_limit: tokenLimit,
-      }, { status: 429 });
-    }
-  }
-
-  const ownerTokenIndices = poolUser.owner_token_indices || [];
-  let resolved = null;
-  let isOwnToken = false;
-
-  if (ownerTokenIndices.length > 0) {
-    resolved = await resolveTokenPreferred(ownerTokenIndices, env);
-    if (resolved) isOwnToken = true;
-  }
-
-  const canUsePool = !isProviderPoolKey || (tokenLimit > 0 && !subscriptionExhausted);
-  if (!resolved && canUsePool) {
-    resolved = await resolveToken(await sessionId(apiKey), env);
-  }
-
-  if (!resolved) {
+  const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, env);
+  if (error) {
     ctx.waitUntil(incrementHourlyCounter(false, env));
-    return new Response(
-      JSON.stringify({ type: "error", error: { type: "overloaded_error",
-        message: isProviderPoolKey
-          ? "Your token is at capacity or disabled. Wait for the rate limit to reset or add another token."
-          : "No tokens available in the pool. All provider tokens are at capacity or disabled.",
-      }}),
-      { status: 529, headers: { "Content-Type": "application/json", "Retry-After": "300" } },
-    );
+    return error;
   }
 
   const bodyBytes = request.body ? await request.arrayBuffer() : null;
@@ -135,6 +87,57 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
   );
 
   return new Response(trackedBody, { status: response.status, headers: response.headers });
+}
+
+async function resolveAuthorizedToken(apiKey, poolUser, env) {
+  const isProviderPoolKey = poolUser.provider_key === true;
+  const tokenLimit = poolUser.plan_tokens || 0;
+  const tokensUsed = poolUser.tokens_used_period || 0;
+  const subscriptionExhausted = tokenLimit > 0 && tokensUsed >= tokenLimit;
+
+  if (subscriptionExhausted && !isProviderPoolKey) {
+    if (poolUser.auto_refresh_enabled) {
+      const topupResult = await attemptAutoRefresh(apiKey, poolUser, env);
+      if (!topupResult.success) {
+        return { error: Response.json({
+          error: `Auto refresh failed: ${topupResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
+          tokens_used: tokensUsed, token_limit: tokenLimit,
+        }, { status: 429 }) };
+      }
+    } else {
+      return { error: Response.json({
+        error: "You've used all your tokens this period. Enable auto refresh ($8 for 4M tokens) or wait for your next billing cycle. https://clawpool.ai/dashboard",
+        tokens_used: tokensUsed, token_limit: tokenLimit,
+      }, { status: 429 }) };
+    }
+  }
+
+  let resolved = null;
+  let isOwnToken = false;
+  const ownerTokenIndices = poolUser.owner_token_indices || [];
+
+  if (ownerTokenIndices.length > 0) {
+    resolved = await resolveTokenPreferred(ownerTokenIndices, env);
+    if (resolved) isOwnToken = true;
+  }
+
+  const canUsePool = !isProviderPoolKey || (tokenLimit > 0 && !subscriptionExhausted);
+  if (!resolved && canUsePool) {
+    resolved = await resolveToken(await sessionId(apiKey), env);
+  }
+
+  if (!resolved) {
+    return { error: new Response(
+      JSON.stringify({ type: "error", error: { type: "overloaded_error",
+        message: isProviderPoolKey
+          ? "Your token is at capacity or disabled. Wait for the rate limit to reset or add another token."
+          : "No tokens available in the pool. All provider tokens are at capacity or disabled.",
+      }}),
+      { status: 529, headers: { "Content-Type": "application/json", "Retry-After": "300" } },
+    ) };
+  }
+
+  return { resolved, isOwnToken, isProviderPoolKey };
 }
 
 function extractPoolKey(authHeader) {
