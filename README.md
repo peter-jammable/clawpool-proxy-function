@@ -1,6 +1,6 @@
 # ClawPool Proxy Function
 
-This is the actual deployed code that handles every API request through `proxy.clawpool.ai`. It's published here so you can see exactly what happens to your requests.
+The deployed proxy function running on `proxy.clawpool.ai`.
 
 ## Quick start
 
