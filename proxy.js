@@ -157,11 +157,7 @@ function extractPoolKey(authHeader) {
   return match ? match[1] : null;
 }
 
-/**
- * Auth swap (pool key → provider OAuth token) and forward to Anthropic.
- * Also injects the OAuth beta flag required for sk-ant-oat tokens.
- * Headers are cloned — the original request is not mutated.
- */
+/** Auth swap (pool key → provider OAuth token) and forward to Anthropic. */
 function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
   const headers = new Headers(originalRequest.headers);
   headers.delete("x-api-key");
