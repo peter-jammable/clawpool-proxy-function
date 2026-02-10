@@ -6,8 +6,6 @@
  * happens to your requests. The imports reference private modules that
  * aren't included — you can read the full flow, but can't run it in
  * isolation.
- *
- * Source: https://github.com/peter-jammable/clawpool-proxy-function
  */
 
 // ── Private modules (not in public repo) ────────────────────────────
