@@ -13,6 +13,7 @@ import { totalTokens, updateUsage, deductCredits, updatePoolUsage, updateTokenRa
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
 import { attemptAutoRefresh } from "./stripe.js";
+import { locationHintForRegion } from "./regions.js";
 
 const UPSTREAM = "https://api.anthropic.com";
 
@@ -34,14 +35,14 @@ export async function handleProxyRequest(request, url, env, ctx) {
   }
 
   const bodyBytes = request.body ? await request.arrayBuffer() : null;
-  let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes);
+  let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
 
   if (response.status === 401 || response.status === 403 || response.status === 429) {
     const fallback = isOwnToken
       ? await resolveToken(await sessionId(apiKey), env)
       : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
     if (fallback) {
-      response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes);
+      response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes, env, fallback.token.region);
       return handleResponse(response, fallback.tokenIndex, apiKey, env, ctx, false, false);
     }
   }
@@ -145,7 +146,7 @@ function extractPoolKey(authHeader) {
   return match ? match[1] : null;
 }
 
-function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
+function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes, env, tokenRegion) {
   const headers = new Headers(originalRequest.headers);
   headers.delete("x-api-key");
   headers.set("Authorization", `Bearer ${resolvedToken}`);
@@ -156,11 +157,22 @@ function forwardToAnthropic(originalRequest, url, resolvedToken, bodyBytes) {
     headers.set("anthropic-beta", beta ? `${beta},oauth-2025-04-20` : "oauth-2025-04-20");
   }
 
-  return fetch(UPSTREAM + url.pathname + url.search, {
+  const upstreamUrl = UPSTREAM + url.pathname + url.search;
+  const upstreamRequest = new Request(upstreamUrl, {
     method: originalRequest.method,
     headers,
     body: bodyBytes,
   });
+
+  // Route through regional DO if the token has a region
+  if (tokenRegion && env.REGIONAL_PROXY) {
+    const locationHint = locationHintForRegion(tokenRegion);
+    const durableObjectId = env.REGIONAL_PROXY.idFromName(tokenRegion);
+    const stub = env.REGIONAL_PROXY.get(durableObjectId, { locationHint });
+    return stub.fetch(upstreamRequest);
+  }
+
+  return fetch(upstreamRequest);
 }
 
 function extractRateLimits(response) {
