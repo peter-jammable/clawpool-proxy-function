@@ -18,36 +18,43 @@ import { locationHintForRegion } from "./regions.js";
 const UPSTREAM = "https://api.anthropic.com";
 
 export async function handleProxyRequest(request, url, env, ctx) {
+  try {
+    const apiKey = extractPoolKey(request.headers.get("authorization"))
+      || request.headers.get("x-api-key")
+      || "";
 
-  const apiKey = extractPoolKey(request.headers.get("authorization"))
-    || request.headers.get("x-api-key")
-    || "";
-
-  const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
-  if (!poolUser) {
-    return Response.json({ error: "Invalid pool key" }, { status: 401 });
-  }
-
-  const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, env);
-  if (error) {
-    if (error.status === 529) ctx.waitUntil(updateStatusAudit(false, env));
-    return error;
-  }
-
-  const bodyBytes = request.body ? await request.arrayBuffer() : null;
-  let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
-
-  if (response.status === 401 || response.status === 403 || response.status === 429) {
-    const fallback = isOwnToken
-      ? await resolveToken(await sessionId(apiKey), env)
-      : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
-    if (fallback) {
-      response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes, env, fallback.token.region);
-      return handleResponse(response, fallback.tokenIndex, apiKey, env, ctx, false, false);
+    const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
+    if (!poolUser) {
+      return Response.json({ error: "Invalid pool key" }, { status: 401 });
     }
-  }
 
-  return handleResponse(response, resolved.tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey);
+    const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, env);
+    if (error) {
+      if (error.status === 529) ctx.waitUntil(updateStatusAudit(false, env));
+      return error;
+    }
+
+    const bodyBytes = request.body ? await request.arrayBuffer() : null;
+    let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
+
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      const fallback = isOwnToken
+        ? await resolveToken(await sessionId(apiKey), env)
+        : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
+      if (fallback) {
+        response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes, env, fallback.token.region);
+        return handleResponse(response, fallback.tokenIndex, apiKey, env, ctx, false, false);
+      }
+    }
+
+    return handleResponse(response, resolved.tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey);
+  } catch (proxyError) {
+    console.error("[handleProxyRequest] Unhandled error:", proxyError?.message || proxyError, proxyError?.stack);
+    return Response.json(
+      { error: `Proxy error: ${proxyError?.message || "unknown"}` },
+      { status: 500 },
+    );
+  }
 }
 
 function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey) {
