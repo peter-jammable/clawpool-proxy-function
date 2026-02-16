@@ -28,7 +28,21 @@ export async function handleProxyRequest(request, url, env, ctx) {
       return Response.json({ error: "Invalid pool key" }, { status: 401 });
     }
 
-    const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, env);
+    // Check seat is enabled (team seats can be disabled by admin)
+    if (poolUser.enabled === false) {
+      return Response.json({ error: "This pool key has been disabled by your team admin." }, { status: 403 });
+    }
+
+    // Resolve billing record: team record if team_id present, else poolkey itself (legacy)
+    let billingRecord;
+    if (poolUser.team_id) {
+      billingRecord = await env.POOL.get(`team:${poolUser.team_id}`, "json");
+      if (!billingRecord) return Response.json({ error: "Team not found" }, { status: 500 });
+    } else {
+      billingRecord = poolUser;
+    }
+
+    const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, billingRecord, env);
     if (error) {
       if (error.status === 529) ctx.waitUntil(updateStatusAudit(false, env));
       return error;
@@ -96,15 +110,16 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
   return new Response(trackedBody, { status: response.status, headers: response.headers });
 }
 
-async function resolveAuthorizedToken(apiKey, poolUser, env) {
+async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
   const isProviderPoolKey = poolUser.provider_key === true;
-  const tokenLimit = poolUser.plan_tokens || 0;
-  const tokensUsed = poolUser.tokens_used_period || 0;
+  const tokenLimit = billingRecord.plan_tokens || 0;
+  const tokensUsed = billingRecord.tokens_used_period || 0;
   const subscriptionExhausted = tokenLimit > 0 && tokensUsed >= tokenLimit;
 
   if (subscriptionExhausted && !isProviderPoolKey) {
-    if (poolUser.auto_refresh_enabled) {
-      const refreshResult = await attemptAutoRefresh(apiKey, poolUser, env);
+    if (billingRecord.auto_refresh_enabled) {
+      const teamId = poolUser.team_id || null;
+      const refreshResult = await attemptAutoRefresh(apiKey, billingRecord, env, teamId);
       if (!refreshResult.success) {
         return { error: Response.json({
           error: `Auto refresh failed: ${refreshResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
@@ -128,7 +143,7 @@ async function resolveAuthorizedToken(apiKey, poolUser, env) {
     if (resolved) isOwnToken = true;
   }
 
-  const canUsePool = !isProviderPoolKey || (tokenLimit > 0 && !subscriptionExhausted);
+  const canUsePool = !isProviderPoolKey || (billingRecord.plan_tokens > 0 && !subscriptionExhausted);
   if (!resolved && canUsePool) {
     resolved = await resolveToken(await sessionId(apiKey), env);
   }
