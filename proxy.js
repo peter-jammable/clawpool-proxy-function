@@ -12,7 +12,7 @@ import { sessionId, resolveToken, resolveTokenPreferred, rotateToken } from "./a
 import { totalTokens, updateUsage, deductCredits, updatePoolUsage, updateTokenRateLimits, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
-import { attemptAutoRefresh } from "./stripe.js";
+import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { locationHintForRegion } from "./regions.js";
 
 const UPSTREAM = "https://api.anthropic.com";
@@ -42,8 +42,11 @@ export async function handleProxyRequest(request, url, env, ctx) {
       billingRecord = poolUser;
     }
 
-    const { resolved, isOwnToken, isProviderPoolKey, error } = await resolveAuthorizedToken(apiKey, poolUser, billingRecord, env);
+    const { resolved, isOwnToken, isProviderPoolKey, isTrialToken, error, endTrial } = await resolveAuthorizedToken(apiKey, poolUser, billingRecord, env);
     if (error) {
+      if (endTrial) {
+        ctx.waitUntil(endTrialAndActivate(endTrial.teamId, endTrial.poolKey, env));
+      }
       if (error.status === 529) ctx.waitUntil(updateStatusAudit(false, env));
       return error;
     }
@@ -52,6 +55,10 @@ export async function handleProxyRequest(request, url, env, ctx) {
     let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
 
     if (response.status === 401 || response.status === 403 || response.status === 429) {
+      // Trial users: no pool fallback, return the error directly
+      if (isTrialToken) {
+        return response;
+      }
       const fallback = isOwnToken
         ? await resolveToken(await sessionId(apiKey), env)
         : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
@@ -117,6 +124,18 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
   const subscriptionExhausted = tokenLimit > 0 && tokensUsed >= tokenLimit;
 
   if (subscriptionExhausted && !isProviderPoolKey) {
+    // Trial exhaustion: return 429 and trigger async upgrade to paid plan
+    if (billingRecord.is_trial) {
+      return {
+        error: Response.json({
+          error: "Your free trial is complete! Your subscription is now active. Please retry your request.",
+          trial_exhausted: true,
+          tokens_used: tokensUsed, token_limit: tokenLimit,
+        }, { status: 429 }),
+        endTrial: { teamId: poolUser.team_id, poolKey: apiKey },
+      };
+    }
+
     if (billingRecord.auto_refresh_enabled) {
       const teamId = poolUser.team_id || null;
       const refreshResult = await attemptAutoRefresh(apiKey, billingRecord, env, teamId);
@@ -132,6 +151,30 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
         tokens_used: tokensUsed, token_limit: tokenLimit,
       }, { status: 429 }) };
     }
+  }
+
+  // Trial token routing: pin to admin token, no pool fallback
+  if (poolUser.trial_token_index !== undefined) {
+    const { decryptToken } = await import("./crypto.js");
+    let tokenIndex = poolUser.trial_token_index;
+    let token = await env.POOL.get(`token:${tokenIndex}`, "json");
+
+    // Fallback: if cached index is stale (token deleted/recreated), re-resolve from email
+    if (!token || !token.enabled || token.deleted) {
+      const { resolveAdminTokenIndex } = await import("./dashboard.js");
+      tokenIndex = await resolveAdminTokenIndex(env);
+      if (tokenIndex !== null) {
+        token = await env.POOL.get(`token:${tokenIndex}`, "json");
+      }
+    }
+
+    if (token && token.enabled && !token.deleted) {
+      if (token.encrypted && env.TOKEN_ENCRYPTION_KEY) {
+        token.oauth_token = await decryptToken(token.oauth_token, env.TOKEN_ENCRYPTION_KEY);
+      }
+      return { resolved: { tokenIndex, token }, isOwnToken: false, isProviderPoolKey: false, isTrialToken: true };
+    }
+    return { error: Response.json({ error: "Trial service temporarily unavailable." }, { status: 503 }) };
   }
 
   let resolved = null;
@@ -159,7 +202,7 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
     ) };
   }
 
-  return { resolved, isOwnToken, isProviderPoolKey };
+  return { resolved, isOwnToken, isProviderPoolKey, isTrialToken: false };
 }
 
 function extractPoolKey(authHeader) {
