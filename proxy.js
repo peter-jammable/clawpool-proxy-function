@@ -121,7 +121,7 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
   const isProviderPoolKey = poolUser.provider_key === true;
   const tokenLimit = billingRecord.plan_tokens || 0;
   const tokensUsed = billingRecord.tokens_used_period || 0;
-  const subscriptionExhausted = tokenLimit > 0 && tokensUsed >= tokenLimit;
+  const subscriptionExhausted = tokensUsed >= tokenLimit;
 
   if (subscriptionExhausted && !isProviderPoolKey) {
     // Trial exhaustion: return 429 and trigger async upgrade to paid plan
