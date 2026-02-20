@@ -140,8 +140,9 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
       const teamId = poolUser.team_id || null;
       const refreshResult = await attemptAutoRefresh(apiKey, billingRecord, env, teamId);
       if (!refreshResult.success) {
+        const manageUrl = refreshResult.portal_url || "https://clawpool.ai/dashboard";
         return { error: Response.json({
-          error: `Auto refresh failed: ${refreshResult.error}. Update your payment method at https://clawpool.ai/dashboard`,
+          error: `Auto refresh failed. Update your payment method: ${manageUrl}`,
           tokens_used: tokensUsed, token_limit: tokenLimit,
         }, { status: 429 }) };
       }
