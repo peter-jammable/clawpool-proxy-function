@@ -102,7 +102,7 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
         updateTokenRateLimits(tokenIndex, null, env, usage),
         ...(!isOwnToken ? [
           deductCredits(apiKey, usage, env),
-          recordUsage(apiKey, tokenIndex, usage, env),
+          recordUsage(apiKey, tokenIndex, usage, env, rateLimits),
           updatePoolUsage(tokenIndex, usage, env),
         ] : isProviderPoolKey ? [
           deductCredits(apiKey, usage, env),
