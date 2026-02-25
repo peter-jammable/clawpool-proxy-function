@@ -9,13 +9,32 @@
  */
 
 import { sessionId, resolveToken, resolveTokenPreferred, rotateToken } from "./auth.js";
-import { totalTokens, updateUsage, deductCredits, updatePoolUsage, updateTokenRateLimits, checkUsageThresholds } from "./usage.js";
+import { totalTokens, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { locationHintForRegion } from "./regions.js";
 
 const UPSTREAM = "https://api.anthropic.com";
+
+/**
+ * Get the ConsumerBilling DO stub for a pool user.
+ * Keyed by team ID (for team users) or pool key (for legacy solo users).
+ */
+function getConsumerBillingStub(env, poolUser, apiKey) {
+  const billingDoId = poolUser.team_id
+    ? env.CONSUMER_BILLING.idFromName(`team:${poolUser.team_id}`)
+    : env.CONSUMER_BILLING.idFromName(`key:${apiKey}`);
+  return env.CONSUMER_BILLING.get(billingDoId);
+}
+
+/**
+ * Get the ProviderToken DO stub for a token index.
+ */
+function getProviderTokenStub(env, tokenIndex) {
+  const doId = env.PROVIDER_TOKEN.idFromName(String(tokenIndex));
+  return env.PROVIDER_TOKEN.get(doId);
+}
 
 export async function handleProxyRequest(request, url, env, ctx) {
   try {
@@ -42,7 +61,45 @@ export async function handleProxyRequest(request, url, env, ctx) {
       billingRecord = poolUser;
     }
 
-    const { resolved, isOwnToken, isProviderPoolKey, isTrialToken, error, endTrial } = await resolveAuthorizedToken(apiKey, poolUser, billingRecord, env);
+    // --- ConsumerBilling DO gate: authorize before forwarding ---
+    const billingStub = getConsumerBillingStub(env, poolUser, apiKey);
+    const isProviderPoolKey = poolUser.provider_key === true;
+    let doExhausted = false;
+
+    if (!isProviderPoolKey && poolUser.trial_token_index === undefined) {
+      const authResult = await billingStub
+        .fetch(new Request("https://do/authorize", {
+          method: "POST",
+          body: JSON.stringify({ planTokens: billingRecord.plan_tokens || 0 }),
+        }))
+        .then((response) => response.json());
+
+      if (!authResult.authorized) {
+        if (authResult.reason === "rate_limited") {
+          return new Response(
+            JSON.stringify({
+              type: "error",
+              error: {
+                type: "rate_limit_error",
+                message: "Too many requests. Please slow down.",
+              },
+            }),
+            {
+              status: 429,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": String(authResult.retryAfter || 5),
+              },
+            },
+          );
+        }
+        // reason === "exhausted" — pass to resolveAuthorizedToken
+        // which handles auto-refresh, trial exhaustion, etc.
+        doExhausted = true;
+      }
+    }
+
+    const { resolved, isOwnToken, isProviderPoolKey: isProviderKey, isTrialToken, error, endTrial } = await resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doExhausted);
     if (error) {
       if (endTrial) {
         ctx.waitUntil(endTrialAndActivate(endTrial.teamId, endTrial.poolKey, env));
@@ -64,11 +121,11 @@ export async function handleProxyRequest(request, url, env, ctx) {
         : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
       if (fallback) {
         response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes, env, fallback.token.region);
-        return handleResponse(response, fallback.tokenIndex, apiKey, env, ctx, false, false);
+        return handleResponse(response, fallback.tokenIndex, apiKey, poolUser, env, ctx, false, false, billingStub);
       }
     }
 
-    return handleResponse(response, resolved.tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey);
+    return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub);
   } catch (proxyError) {
     console.error("[handleProxyRequest] Unhandled error:", proxyError?.message || proxyError, proxyError?.stack);
     return Response.json(
@@ -78,12 +135,20 @@ export async function handleProxyRequest(request, url, env, ctx) {
   }
 }
 
-function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isProviderPoolKey) {
+function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderPoolKey, billingStub) {
   ctx.waitUntil(updateStatusAudit(response.ok, env));
 
   const rateLimits = extractRateLimits(response);
+  const providerTokenStub = getProviderTokenStub(env, tokenIndex);
+
+  // Route rate limit header updates through ProviderToken DO
   if (rateLimits) {
-    ctx.waitUntil(updateTokenRateLimits(tokenIndex, rateLimits, env));
+    ctx.waitUntil(
+      providerTokenStub.fetch(new Request("https://do/update", {
+        method: "POST",
+        body: JSON.stringify({ tokenIndex, rateLimits, usage: null }),
+      })),
+    );
   }
 
   const contentType = response.headers.get("content-type") || "";
@@ -97,31 +162,75 @@ function handleResponse(response, tokenIndex, apiKey, env, ctx, isOwnToken, isPr
 
   ctx.waitUntil(
     usagePromise.then(async (usage) => {
-      await Promise.all([
-        updateUsage(tokenIndex, usage, env),
-        updateTokenRateLimits(tokenIndex, null, env, usage),
-        ...(!isOwnToken ? [
-          deductCredits(apiKey, usage, env),
-          recordUsage(apiKey, tokenIndex, usage, env, rateLimits),
-          updatePoolUsage(tokenIndex, usage, env),
-        ] : isProviderPoolKey ? [
-          deductCredits(apiKey, usage, env),
-        ] : []),
-      ]);
+      const billableTokens = totalTokens(usage);
+
+      // --- ProviderToken DO: rate limits + capacity scoring + daily usage ---
+      await providerTokenStub.fetch(new Request("https://do/update", {
+        method: "POST",
+        body: JSON.stringify({ tokenIndex, rateLimits: null, usage }),
+      }));
+
+      await providerTokenStub.fetch(new Request("https://do/record-daily-usage", {
+        method: "POST",
+        body: JSON.stringify({ tokenIndex, billableTokens }),
+      }));
+
+      // --- Pool request tracking (non-own-token requests) ---
       if (!isOwnToken) {
-        await checkUsageThresholds(apiKey, env).catch(() => {});
+        // ConsumerBilling DO: deduct credits
+        const kvTeamKey = poolUser.team_id ? `team:${poolUser.team_id}` : null;
+        const kvSeatKey = `poolkey:${apiKey}`;
+        const deductResult = await billingStub
+          .fetch(new Request("https://do/deduct", {
+            method: "POST",
+            body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey }),
+          }))
+          .then((response) => response.json());
+
+        if (deductResult.alertThreshold) {
+          await checkUsageThresholds(apiKey, env).catch(() => {});
+        }
+
+        // Ledger entry (already idempotent via unique IDs)
+        await recordUsage(apiKey, tokenIndex, usage, env, rateLimits);
+
+        // ProviderToken DO: pool usage windows
+        await providerTokenStub.fetch(new Request("https://do/record-pool-usage", {
+          method: "POST",
+          body: JSON.stringify({ tokenIndex, billableTokens }),
+        }));
+      } else if (isProviderPoolKey) {
+        // Provider pool key: deduct credits from their consumer allocation
+        const kvTeamKey = poolUser.team_id ? `team:${poolUser.team_id}` : null;
+        const kvSeatKey = `poolkey:${apiKey}`;
+        await billingStub.fetch(new Request("https://do/deduct", {
+          method: "POST",
+          body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey }),
+        }));
       }
-    })
+
+      // Update session tokens_served for usage-based rotation
+      const sessionHash = await sessionId(apiKey);
+      const sessionKey = `session:${sessionHash}`;
+      const session = await env.POOL.get(sessionKey, "json");
+      if (session) {
+        session.tokens_served = (session.tokens_served || 0) + billableTokens;
+        const ttl = parseInt(env.SESSION_TTL || "3600", 10);
+        await env.POOL.put(sessionKey, JSON.stringify(session), { expirationTtl: ttl });
+      }
+    }),
   );
 
   return new Response(trackedBody, { status: response.status, headers: response.headers });
 }
 
-async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
+async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doExhausted = false) {
   const isProviderPoolKey = poolUser.provider_key === true;
   const tokenLimit = billingRecord.plan_tokens || 0;
   const tokensUsed = billingRecord.tokens_used_period || 0;
-  const subscriptionExhausted = tokensUsed >= tokenLimit;
+  // DO is the authoritative source for exhaustion — KV is a fallback for
+  // provider pool keys and trial users that skip the DO gate
+  const subscriptionExhausted = doExhausted || (tokensUsed >= tokenLimit);
 
   if (subscriptionExhausted && !isProviderPoolKey) {
     // Trial exhaustion: return 429 and trigger async upgrade to paid plan
@@ -160,7 +269,7 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env) {
     let tokenIndex = poolUser.trial_token_index;
     let token = await env.POOL.get(`token:${tokenIndex}`, "json");
 
-    // Fallback: if cached index is stale (token deleted/recreated), re-resolve from email
+    // If cached index is stale (token deleted/recreated), re-resolve from email
     if (!token || !token.enabled || token.deleted) {
       const { resolveAdminTokenIndex } = await import("./dashboard.js");
       tokenIndex = await resolveAdminTokenIndex(env);
