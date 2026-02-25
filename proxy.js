@@ -75,24 +75,6 @@ export async function handleProxyRequest(request, url, env, ctx) {
         .then((response) => response.json());
 
       if (!authResult.authorized) {
-        if (authResult.reason === "rate_limited") {
-          return new Response(
-            JSON.stringify({
-              type: "error",
-              error: {
-                type: "rate_limit_error",
-                message: "Too many requests. Please slow down.",
-              },
-            }),
-            {
-              status: 429,
-              headers: {
-                "Content-Type": "application/json",
-                "Retry-After": String(authResult.retryAfter || 5),
-              },
-            },
-          );
-        }
         // reason === "exhausted" — pass to resolveAuthorizedToken
         // which handles auto-refresh, trial exhaustion, etc.
         doExhausted = true;
