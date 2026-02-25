@@ -183,7 +183,7 @@ function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnT
         const deductResult = await billingStub
           .fetch(new Request("https://do/deduct", {
             method: "POST",
-            body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey }),
+            body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey, teamId: poolUser.team_id }),
           }))
           .then((response) => response.json());
 
@@ -205,7 +205,7 @@ function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnT
         const kvSeatKey = `poolkey:${apiKey}`;
         await billingStub.fetch(new Request("https://do/deduct", {
           method: "POST",
-          body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey }),
+          body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey, teamId: poolUser.team_id }),
         }));
       }
 
