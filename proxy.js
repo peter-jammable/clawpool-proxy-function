@@ -91,6 +91,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
     }
 
     const bodyBytes = request.body ? await request.arrayBuffer() : null;
+    const requestedModelFamily = extractModelFamily(bodyBytes);
     let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
 
     if (response.status === 401 || response.status === 403 || response.status === 429) {
@@ -103,11 +104,11 @@ export async function handleProxyRequest(request, url, env, ctx) {
         : await rotateToken(await sessionId(apiKey), resolved.tokenIndex, env);
       if (fallback) {
         response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes, env, fallback.token.region);
-        return handleResponse(response, fallback.tokenIndex, apiKey, poolUser, env, ctx, false, false, billingStub);
+        return handleResponse(response, fallback.tokenIndex, apiKey, poolUser, env, ctx, false, false, billingStub, requestedModelFamily);
       }
     }
 
-    return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub);
+    return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub, requestedModelFamily);
   } catch (proxyError) {
     console.error("[handleProxyRequest] Unhandled error:", proxyError?.message || proxyError, proxyError?.stack);
     return Response.json(
@@ -117,7 +118,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
   }
 }
 
-function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderPoolKey, billingStub) {
+function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderPoolKey, billingStub, requestedModelFamily) {
   ctx.waitUntil(updateStatusAudit(response.ok, env));
 
   const rateLimits = extractRateLimits(response);
@@ -174,7 +175,7 @@ function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnT
         }
 
         // Ledger entry (already idempotent via unique IDs)
-        await recordUsage(apiKey, tokenIndex, usage, env, rateLimits);
+        await recordUsage(apiKey, tokenIndex, usage, env, rateLimits, requestedModelFamily);
 
         // ProviderToken DO: pool usage windows
         await providerTokenStub.fetch(new Request("https://do/record-pool-usage", {
@@ -295,6 +296,21 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
   }
 
   return { resolved, isOwnToken, isProviderPoolKey, isTrialToken: false };
+}
+
+/**
+ * Extract the model family (opus, sonnet, haiku) from raw request body bytes.
+ * Regex on the raw string — no JSON parsing needed.
+ */
+function extractModelFamily(bodyBytes) {
+  if (!bodyBytes) return null;
+  try {
+    const text = new TextDecoder().decode(bodyBytes.slice(0, 500)); // only need the start
+    const match = text.match(/\b(opus|sonnet|haiku)\b/i);
+    return match ? match[1].toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 function extractPoolKey(authHeader) {
