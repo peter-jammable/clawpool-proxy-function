@@ -247,22 +247,29 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
     }
   }
 
-  // Trial token routing: pin to admin token, no pool fallback
+  // Trial token routing: pick the best available admin token
   if (poolUser.trial_token_index !== undefined) {
     const { decryptToken } = await import("./crypto.js");
-    let tokenIndex = poolUser.trial_token_index;
-    let token = await env.POOL.get(`token:${tokenIndex}`, "json");
+    const { resolveAdminTokens } = await import("./dashboard.js");
+    const { isProviderActive } = await import("./token-routing.js");
+    const adminTokens = await resolveAdminTokens(env);
+    const now = Date.now();
 
-    // If cached index is stale (token deleted/recreated), re-resolve from email
-    if (!token || !token.enabled || token.deleted) {
-      const { resolveAdminTokenIndex } = await import("./dashboard.js");
-      tokenIndex = await resolveAdminTokenIndex(env);
-      if (tokenIndex !== null) {
-        token = await env.POOL.get(`token:${tokenIndex}`, "json");
+    // Pick first admin token that's currently active (or has no active hours restriction)
+    let chosen = null;
+    for (const entry of adminTokens) {
+      if (!entry.token.timezone || entry.token.timezone === "any" || !entry.token.active_hours) {
+        chosen = entry;
+        break;
+      }
+      if (isProviderActive(entry.token, now)) {
+        chosen = entry;
+        break;
       }
     }
 
-    if (token && token.enabled && !token.deleted) {
+    if (chosen) {
+      const { tokenIndex, token } = chosen;
       if (token.encrypted && env.TOKEN_ENCRYPTION_KEY) {
         token.oauth_token = await decryptToken(token.oauth_token, env.TOKEN_ENCRYPTION_KEY);
       }
