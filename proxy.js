@@ -8,7 +8,8 @@
  * isolation.
  */
 
-import { sessionId, resolveToken, resolveTokenPreferred, rotateToken } from "./auth.js";
+import { sessionId, resolveToken, rotateToken } from "./token-routing.js";
+import { resolveTokenPreferred } from "./auth.js";
 import { totalTokens, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
