@@ -20,12 +20,9 @@ const UPSTREAM = "https://api.anthropic.com";
 
 /**
  * Get the ConsumerBilling DO stub for a pool user.
- * Keyed by team ID (for team users) or pool key (for legacy solo users).
  */
-function getConsumerBillingStub(env, poolUser, apiKey) {
-  const billingDoId = poolUser.team_id
-    ? env.CONSUMER_BILLING.idFromName(`team:${poolUser.team_id}`)
-    : env.CONSUMER_BILLING.idFromName(`key:${apiKey}`);
+function getConsumerBillingStub(env, poolUser) {
+  const billingDoId = env.CONSUMER_BILLING.idFromName(`team:${poolUser.team_id}`);
   return env.CONSUMER_BILLING.get(billingDoId);
 }
 
@@ -53,17 +50,12 @@ export async function handleProxyRequest(request, url, env, ctx) {
       return Response.json({ error: "This pool key has been disabled by your team admin." }, { status: 403 });
     }
 
-    // Resolve billing record: team record if team_id present, else poolkey itself (legacy)
-    let billingRecord;
-    if (poolUser.team_id) {
-      billingRecord = await env.POOL.get(`team:${poolUser.team_id}`, "json");
-      if (!billingRecord) return Response.json({ error: "Team not found" }, { status: 500 });
-    } else {
-      billingRecord = poolUser;
-    }
+    // Resolve billing record from team
+    const billingRecord = await env.POOL.get(`team:${poolUser.team_id}`, "json");
+    if (!billingRecord) return Response.json({ error: "Team not found" }, { status: 500 });
 
     // --- ConsumerBilling DO gate: authorize before forwarding ---
-    const billingStub = getConsumerBillingStub(env, poolUser, apiKey);
+    const billingStub = getConsumerBillingStub(env, poolUser);
     const isProviderPoolKey = poolUser.provider_key === true;
     let doExhausted = false;
 
