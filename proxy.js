@@ -54,6 +54,11 @@ export async function handleProxyRequest(request, url, env, ctx) {
     const billingRecord = await env.POOL.get(`team:${poolUser.team_id}`, "json");
     if (!billingRecord) return Response.json({ error: "Team not found" }, { status: 500 });
 
+    // Team-level block check (admin can block entire accounts)
+    if (billingRecord.blocked) {
+      return Response.json({ error: "This account has been blocked. Contact support@clawpool.ai" }, { status: 403 });
+    }
+
     // --- ConsumerBilling DO gate: authorize before forwarding ---
     const billingStub = getConsumerBillingStub(env, poolUser);
     const isProviderPoolKey = poolUser.provider_key === true;
