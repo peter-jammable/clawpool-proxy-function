@@ -14,6 +14,7 @@ import { totalTokens, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
+import { attemptPartnerAutoRefresh } from "./partner.js";
 import { locationHintForRegion } from "./regions.js";
 
 const UPSTREAM = "https://api.anthropic.com";
@@ -214,8 +215,19 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
   const subscriptionExhausted = doExhausted || (tokensUsed >= tokenLimit);
 
   if (subscriptionExhausted && !isProviderPoolKey) {
+    // Partner auto-refresh: reset immediately, no Stripe involved
+    if (billingRecord.partner) {
+      const partnerRefresh = await attemptPartnerAutoRefresh(apiKey, billingRecord, env, poolUser.team_id);
+      if (!partnerRefresh.success) {
+        return { error: Response.json({
+          error: "Partner key refresh cap reached. Contact your provider to reset.",
+          tokens_used: tokensUsed, token_limit: tokenLimit,
+        }, { status: 429 }) };
+      }
+      // Refresh succeeded — fall through to token resolution
+    }
     // Trial exhaustion: return 429 and trigger async upgrade to paid plan
-    if (billingRecord.is_trial) {
+    else if (billingRecord.is_trial) {
       return {
         error: Response.json({
           error: "Your free trial is complete! Your subscription is now active. Please retry your request.",
@@ -226,7 +238,7 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
       };
     }
 
-    if (billingRecord.auto_refresh_enabled) {
+    else if (billingRecord.auto_refresh_enabled) {
       const teamId = poolUser.team_id || null;
       const refreshResult = await attemptAutoRefresh(apiKey, billingRecord, env, teamId);
       if (!refreshResult.success) {
