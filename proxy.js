@@ -13,6 +13,7 @@ import { resolveTokenPreferred } from "./auth.js";
 import { totalTokens, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
+import { sendThrottledCapacityAlert } from "./email.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { attemptPartnerAutoRefresh } from "./partner.js";
 import { locationHintForRegion } from "./regions.js";
@@ -85,7 +86,10 @@ export async function handleProxyRequest(request, url, env, ctx) {
       if (endTrial) {
         ctx.waitUntil(endTrialAndActivate(endTrial.teamId, endTrial.poolKey, env));
       }
-      if (error.status === 529) ctx.waitUntil(updateStatusAudit(false, env));
+      if (error.status === 529) {
+        ctx.waitUntil(updateStatusAudit(false, env));
+        ctx.waitUntil(sendThrottledCapacityAlert("claude", env));
+      }
       return error;
     }
 
