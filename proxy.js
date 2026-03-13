@@ -13,7 +13,7 @@ import { resolveTokenPreferred } from "./auth.js";
 import { totalTokens, checkUsageThresholds } from "./usage.js";
 import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
-import { sendThrottledCapacityAlert } from "./email.js";
+import { sendThrottledCapacityAlert, sendProviderCapacityUpsell } from "./email.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { attemptPartnerAutoRefresh } from "./partner.js";
 import { locationHintForRegion } from "./regions.js";
@@ -89,6 +89,10 @@ export async function handleProxyRequest(request, url, env, ctx) {
       if (error.status === 529) {
         ctx.waitUntil(updateStatusAudit(false, env));
         ctx.waitUntil(sendThrottledCapacityAlert("claude", env));
+        // Provider with no consumer subscription — upsell the consumer tier
+        if (poolUser.provider_key && !(billingRecord.plan_tokens > 0)) {
+          ctx.waitUntil(sendProviderCapacityUpsell(poolUser.team_id, env));
+        }
       }
       return error;
     }
