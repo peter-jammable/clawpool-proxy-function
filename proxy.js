@@ -10,13 +10,20 @@
 
 import { sessionId, resolveToken, rotateToken } from "./token-routing.js";
 import { resolveTokenPreferred } from "./auth.js";
-import { totalTokens, checkUsageThresholds } from "./usage.js";
-import { recordUsage } from "./ledger.js";
+import { totalTokens, checkUsageThresholds, updateNvidiaUsage } from "./usage.js";
+import { recordUsage, recordNvidiaUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
-import { sendThrottledCapacityAlert, sendProviderCapacityUpsell } from "./email.js";
+import { sendThrottledCapacityAlert, sendProviderCapacityUpsell, sendAbuseAutoBlockAlert } from "./email.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { attemptPartnerAutoRefresh } from "./partner.js";
 import { locationHintForRegion } from "./regions.js";
+import { updateNvidiaTokenHealth } from "./nvidia-auth.js";
+import { resolveAutoModel } from "./nvidia-benchmark.js";
+import {
+  translateAnthropicRequestToOpenai,
+  translateOpenaiResponseToAnthropic,
+  createOpenaiToAnthropicStream,
+} from "./claude-to-openai.js";
 
 const UPSTREAM = "https://api.anthropic.com";
 
@@ -93,6 +100,10 @@ export async function handleProxyRequest(request, url, env, ctx) {
         if (poolUser.provider_key && !(billingRecord.plan_tokens > 0)) {
           ctx.waitUntil(sendProviderCapacityUpsell(poolUser.team_id, env));
         }
+        // Attempt NVIDIA fallback when all Claude tokens are at capacity
+        const fallbackBodyBytes = request.body ? await request.arrayBuffer() : null;
+        const nvidiaFallbackResponse = await attemptNvidiaFallback(fallbackBodyBytes, apiKey, poolUser, billingStub, env, ctx);
+        if (nvidiaFallbackResponse) return nvidiaFallbackResponse;
       }
       return error;
     }
@@ -102,8 +113,41 @@ export async function handleProxyRequest(request, url, env, ctx) {
     let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
 
     if (response.status === 401 || response.status === 403 || response.status === 429) {
-      // Trial users: no pool fallback, return the error directly
+      // On auth/permission errors, read the body to log and check for abuse
+      if (response.status === 401 || response.status === 403) {
+        const errorBody = await response.text().catch(() => "");
+        console.error(
+          `[proxy] Anthropic ${response.status} — token #${resolved.tokenIndex}, consumer ${apiKey.slice(0, 12)}…, team ${poolUser.team_id}: ${errorBody.slice(0, 300)}`,
+        );
+
+        if (isTokenKillingError(errorBody)) {
+          console.error(
+            `[proxy] ABUSE DETECTED — auto-blocking team ${poolUser.team_id}, pausing token #${resolved.tokenIndex}`,
+          );
+          // Block + pause synchronously to close the window before returning
+          await blockConsumerAndPauseToken(env, poolUser.team_id, resolved.tokenIndex, response.status);
+          // Email alert is fire-and-forget
+          ctx.waitUntil(sendAbuseAlert(env, {
+            consumerPoolKey: apiKey,
+            teamId: poolUser.team_id,
+            tokenIndex: resolved.tokenIndex,
+            anthropicStatus: response.status,
+            anthropicError: errorBody.slice(0, 500),
+          }));
+          return Response.json(
+            { error: "This account has been blocked. Contact support@clawpool.ai" },
+            { status: 403 },
+          );
+        }
+
+        // Non-abuse auth error — reconstruct the response for downstream handling
+        response = new Response(errorBody, { status: response.status, headers: response.headers });
+      }
+
+      // Trial users: no pool rotation, but try NVIDIA fallback
       if (isTrialToken) {
+        const nvidiaFallbackResponse = await attemptNvidiaFallback(bodyBytes, apiKey, poolUser, billingStub, env, ctx);
+        if (nvidiaFallbackResponse) return nvidiaFallbackResponse;
         return response;
       }
       const fallback = isOwnToken
@@ -115,6 +159,12 @@ export async function handleProxyRequest(request, url, env, ctx) {
       }
     }
 
+    // If Anthropic response is still not OK after retries, attempt NVIDIA fallback
+    if (!response.ok) {
+      const nvidiaFallbackResponse = await attemptNvidiaFallback(bodyBytes, apiKey, poolUser, billingStub, env, ctx);
+      if (nvidiaFallbackResponse) return nvidiaFallbackResponse;
+    }
+
     return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub, requestedModelFamily);
   } catch (proxyError) {
     console.error("[handleProxyRequest] Unhandled error:", proxyError?.message || proxyError, proxyError?.stack);
@@ -124,6 +174,75 @@ export async function handleProxyRequest(request, url, env, ctx) {
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Abuse detection — auto-block consumers that kill provider tokens
+// ---------------------------------------------------------------------------
+
+const TOKEN_KILLING_PATTERNS = [
+  /credential.{0,30}(revoked|suspended|disabled|terminated)/i,
+  /account.{0,30}(disabled|suspended|banned|terminated|closed)/i,
+  /violat/i,
+  /\babuse\b/i,
+  /terms of service/i,
+  /access.{0,20}(revoked|terminated|suspended)/i,
+];
+
+function isTokenKillingError(errorBody) {
+  return TOKEN_KILLING_PATTERNS.some((pattern) => pattern.test(errorBody));
+}
+
+/**
+ * Synchronously block the consumer's team and pause the provider token.
+ * Must complete before returning the 403 to close the race window.
+ */
+async function blockConsumerAndPauseToken(env, teamId, tokenIndex, anthropicStatus) {
+  const [teamRecord, tokenRecord] = await Promise.all([
+    env.POOL.get(`team:${teamId}`, "json"),
+    env.POOL.get(`token:${tokenIndex}`, "json"),
+  ]);
+
+  const writes = [];
+
+  if (teamRecord && !teamRecord.blocked) {
+    teamRecord.blocked = true;
+    teamRecord.blocked_at = new Date().toISOString();
+    teamRecord.blocked_reason = `auto-blocked: triggered Anthropic ${anthropicStatus} on token #${tokenIndex}`;
+    writes.push(env.POOL.put(`team:${teamId}`, JSON.stringify(teamRecord)));
+  }
+
+  if (tokenRecord && tokenRecord.enabled !== false) {
+    tokenRecord.enabled = false;
+    tokenRecord.paused_at = new Date().toISOString();
+    tokenRecord.paused_reason = `auto-paused: Anthropic ${anthropicStatus} triggered by consumer`;
+    writes.push(env.POOL.put(`token:${tokenIndex}`, JSON.stringify(tokenRecord)));
+  }
+
+  await Promise.all(writes);
+}
+
+/**
+ * Fire-and-forget: look up consumer email and send admin alert.
+ */
+async function sendAbuseAlert(env, { consumerPoolKey, teamId, tokenIndex, anthropicStatus, anthropicError }) {
+  let consumerEmail = null;
+  const poolKeyRecord = await env.POOL.get(`poolkey:${consumerPoolKey}`, "json");
+  if (poolKeyRecord?.google_id) {
+    const googleUser = await env.POOL.get(`google_user:${poolKeyRecord.google_id}`, "json");
+    consumerEmail = googleUser?.email;
+  }
+
+  await sendAbuseAutoBlockAlert(env, {
+    consumerEmail,
+    consumerPoolKey,
+    teamId,
+    tokenIndex,
+    anthropicStatus,
+    anthropicError,
+  });
+}
+
+// ---------------------------------------------------------------------------
 
 function handleResponse(response, tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderPoolKey, billingStub, requestedModelFamily) {
   ctx.waitUntil(updateStatusAudit(response.ok, env));
@@ -406,6 +525,176 @@ function extractRateLimits(response) {
 
   return Object.keys(limits).length > 0 ? limits : null;
 }
+
+// ---------------------------------------------------------------------------
+// NVIDIA fallback — transparent fallback to NVIDIA when Anthropic is unavailable
+// ---------------------------------------------------------------------------
+
+const NVIDIA_UPSTREAM = "https://integrate.api.nvidia.com";
+const MAX_NVIDIA_FALLBACK_RETRIES = 2;
+
+/**
+ * Attempt to fulfill an Anthropic-format request via NVIDIA when Claude is unavailable.
+ * Translates Anthropic → OpenAI, sends to NVIDIA, translates response back → Anthropic.
+ * Returns null if fallback is not possible (no NVIDIA tokens, NVIDIA also fails, etc.).
+ */
+async function attemptNvidiaFallback(bodyBytes, apiKey, poolUser, billingStub, env, ctx) {
+  if (!bodyBytes) return null;
+
+  let anthropicBody;
+  try {
+    anthropicBody = JSON.parse(new TextDecoder().decode(bodyBytes));
+  } catch {
+    return null;
+  }
+
+  // Only fall back for actual message requests (not count_tokens, etc.)
+  if (!anthropicBody.messages) return null;
+
+  const originalModel = anthropicBody.model || "claude-sonnet-4-5-20250929";
+  const resolvedModel = await resolveAutoModel(env);
+  const openaiBody = translateAnthropicRequestToOpenai(anthropicBody, resolvedModel);
+
+  const hash = await sessionId(apiKey);
+  const resolved = await resolveToken(hash, env, "nvidia");
+  if (!resolved) return null;
+
+  // Forward to NVIDIA with retry logic (same pattern as nvidia-proxy.js)
+  let response = await forwardToNvidiaFallback(resolved.token.api_key, openaiBody);
+  let currentTokenIndex = resolved.tokenIndex;
+  let retries = 0;
+
+  while (!response.ok && retries < MAX_NVIDIA_FALLBACK_RETRIES) {
+    const status = response.status;
+
+    ctx.waitUntil(updateNvidiaTokenHealth(currentTokenIndex, false, status, env));
+
+    if (status === 429) {
+      const rotated = await rotateToken(hash, currentTokenIndex, env, "nvidia");
+      if (!rotated) break;
+      currentTokenIndex = rotated.tokenIndex;
+      response = await forwardToNvidiaFallback(rotated.token.api_key, openaiBody);
+    } else if (status >= 500) {
+      if (retries === 0) {
+        response = await forwardToNvidiaFallback(resolved.token.api_key, openaiBody);
+      } else {
+        const rotated = await rotateToken(hash, currentTokenIndex, env, "nvidia");
+        if (!rotated) break;
+        currentTokenIndex = rotated.tokenIndex;
+        response = await forwardToNvidiaFallback(rotated.token.api_key, openaiBody);
+      }
+    } else {
+      break;
+    }
+
+    retries++;
+  }
+
+  ctx.waitUntil(updateNvidiaTokenHealth(currentTokenIndex, response.ok, response.status, env));
+
+  if (!response.ok) return null;
+
+  console.log(`[proxy] NVIDIA fallback activated — model=${resolvedModel} nvidia_token=${currentTokenIndex} retries=${retries}`);
+
+  const contentType = response.headers.get("content-type") || "";
+
+  if (contentType.includes("text/event-stream")) {
+    // Streaming: pipe through OpenAI→Anthropic translation stream
+    let usageResolve;
+    const usagePromise = new Promise((resolve) => { usageResolve = resolve; });
+    const translatedBody = response.body.pipeThrough(
+      createOpenaiToAnthropicStream(originalModel, (usage) => usageResolve(usage)),
+    );
+
+    ctx.waitUntil(
+      usagePromise.then(async (usage) => {
+        if (usage && (usage.input_tokens > 0 || usage.output_tokens > 0)) {
+          const normalizedUsage = {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+          };
+          const billableTokens = totalTokens(normalizedUsage);
+          const kvTeamKey = poolUser.team_id ? `team:${poolUser.team_id}` : null;
+          const kvSeatKey = `poolkey:${apiKey}`;
+          const [deductResult] = await Promise.all([
+            billingStub.fetch(new Request("https://do/deduct", {
+              method: "POST",
+              body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey, teamId: poolUser.team_id }),
+            })).then((deductResponse) => deductResponse.json()),
+            updateNvidiaUsage(currentTokenIndex, normalizedUsage, env),
+            recordNvidiaUsage(apiKey, currentTokenIndex, normalizedUsage, env),
+          ]);
+          if (deductResult.alertThreshold) {
+            await checkUsageThresholds(apiKey, env).catch(() => {});
+          }
+        }
+      }),
+    );
+
+    return new Response(translatedBody, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      },
+    });
+  } else {
+    // Non-streaming: translate OpenAI JSON → Anthropic JSON
+    const openaiResponse = await response.json();
+    const anthropicResponse = translateOpenaiResponseToAnthropic(openaiResponse, originalModel);
+
+    ctx.waitUntil((async () => {
+      if (openaiResponse.usage) {
+        const normalizedUsage = {
+          input_tokens: openaiResponse.usage.prompt_tokens || 0,
+          output_tokens: openaiResponse.usage.completion_tokens || 0,
+          cache_read_tokens: 0,
+          cache_creation_tokens: 0,
+        };
+        const billableTokens = totalTokens(normalizedUsage);
+        const kvTeamKey = poolUser.team_id ? `team:${poolUser.team_id}` : null;
+        const kvSeatKey = `poolkey:${apiKey}`;
+        const [deductResult] = await Promise.all([
+          billingStub.fetch(new Request("https://do/deduct", {
+            method: "POST",
+            body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey, teamId: poolUser.team_id }),
+          })).then((deductResponse) => deductResponse.json()),
+          updateNvidiaUsage(currentTokenIndex, normalizedUsage, env),
+          recordNvidiaUsage(apiKey, currentTokenIndex, normalizedUsage, env),
+        ]);
+        if (deductResult.alertThreshold) {
+          await checkUsageThresholds(apiKey, env).catch(() => {});
+        }
+      }
+    })());
+
+    return Response.json(anthropicResponse);
+  }
+}
+
+/**
+ * Forward a request to NVIDIA upstream for fallback.
+ * Includes a 60-second timeout to prevent hanging.
+ */
+function forwardToNvidiaFallback(nvidiaApiKey, body) {
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 60_000);
+
+  return fetch(`${NVIDIA_UPSTREAM}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${nvidiaApiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal: abortController.signal,
+  }).finally(() => clearTimeout(timeoutId));
+}
+
+// ---------------------------------------------------------------------------
 
 function createUsageTrackingStream(onUsage) {
   let inputTokens = 0;
