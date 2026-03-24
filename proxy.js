@@ -16,6 +16,7 @@ import { updateStatusAudit } from "./status.js";
 import { sendThrottledCapacityAlert, sendProviderCapacityUpsell, sendAbuseAutoBlockAlert } from "./email.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { attemptPartnerAutoRefresh } from "./partner.js";
+import { getPlans, getPriceForTeam, formatDollars } from "./pricing.js";
 import { locationHintForRegion } from "./regions.js";
 import { updateNvidiaTokenHealth } from "./nvidia-auth.js";
 import { resolveAutoModel } from "./nvidia-benchmark.js";
@@ -377,7 +378,7 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
       }
     } else {
       return { error: Response.json({
-        error: "You've used all your tokens this period. Enable auto refresh ($8 for 4M tokens) or wait for your next billing cycle. https://clawpool.ai/dashboard",
+        error: `You've used all your tokens this period. Enable auto refresh (${formatDollars(getPriceForTeam(getPlans(env), billingRecord).refreshPriceCents)}) or wait for your next billing cycle. https://clawpool.ai/dashboard`,
         tokens_used: tokensUsed, token_limit: tokenLimit,
       }, { status: 429 }) };
     }
