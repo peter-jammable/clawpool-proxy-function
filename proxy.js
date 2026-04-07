@@ -10,21 +10,14 @@
 
 import { sessionId, resolveToken, rotateToken } from "./token-routing.js";
 import { resolveTokenPreferred } from "./auth.js";
-import { totalTokens, checkUsageThresholds, updateNvidiaUsage } from "./usage.js";
-import { recordUsage, recordNvidiaUsage } from "./ledger.js";
+import { totalTokens, checkUsageThresholds } from "./usage.js";
+import { recordUsage } from "./ledger.js";
 import { updateStatusAudit } from "./status.js";
 import { sendThrottledCapacityAlert, sendProviderCapacityUpsell, sendAbuseAutoBlockAlert } from "./email.js";
 import { attemptAutoRefresh, endTrialAndActivate } from "./stripe.js";
 import { attemptPartnerAutoRefresh } from "./partner.js";
 import { getPlans, getPriceForTeam, formatDollars } from "./pricing.js";
 import { locationHintForRegion } from "./regions.js";
-import { updateNvidiaTokenHealth } from "./nvidia-auth.js";
-import { resolveAutoModel } from "./nvidia-benchmark.js";
-import {
-  translateAnthropicRequestToOpenai,
-  translateOpenaiResponseToAnthropic,
-  createOpenaiToAnthropicStream,
-} from "./claude-to-openai.js";
 
 const UPSTREAM = "https://api.anthropic.com";
 
@@ -53,6 +46,24 @@ export async function handleProxyRequest(request, url, env, ctx) {
     const poolUser = await env.POOL.get(`poolkey:${apiKey}`, "json");
     if (!poolUser) {
       return Response.json({ error: "Invalid pool key" }, { status: 401 });
+    }
+
+    // Read body early — needed for heartbeat detection + later forwarding
+    const bodyBytes = request.body ? await request.arrayBuffer() : null;
+
+    if (isHeartbeatRequest(bodyBytes)) {
+      console.log(`[proxy] Blocked OpenClaw heartbeat — consumer ${apiKey.slice(0, 12)}…`);
+      return Response.json({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: "OpenClaw heartbeat requests are blocked on the Claude pool. "
+            + "Heartbeats burn ~20K tokens every 30 minutes for a no-op check. "
+            + "Disable them with heartbeat.every: \"off\" in your OpenClaw config, "
+            + "or set heartbeat.model to a free/cheap model (e.g. NVIDIA). "
+            + "See https://docs.openclaw.ai/gateway/heartbeat",
+        },
+      }, { status: 400 });
     }
 
     // Check seat is enabled (team seats can be disabled by admin)
@@ -101,15 +112,10 @@ export async function handleProxyRequest(request, url, env, ctx) {
         if (poolUser.provider_key && !(billingRecord.plan_tokens > 0)) {
           ctx.waitUntil(sendProviderCapacityUpsell(poolUser.team_id, env));
         }
-        // Attempt NVIDIA fallback when all Claude tokens are at capacity
-        const fallbackBodyBytes = request.body ? await request.arrayBuffer() : null;
-        const nvidiaFallbackResponse = await attemptNvidiaFallback(fallbackBodyBytes, apiKey, poolUser, billingStub, env, ctx);
-        if (nvidiaFallbackResponse) return nvidiaFallbackResponse;
       }
       return error;
     }
 
-    const bodyBytes = request.body ? await request.arrayBuffer() : null;
     const requestedModelFamily = extractModelFamily(bodyBytes);
     let response = await forwardToAnthropic(request, url, resolved.token.oauth_token, bodyBytes, env, resolved.token.region);
 
@@ -141,14 +147,30 @@ export async function handleProxyRequest(request, url, env, ctx) {
           );
         }
 
-        // Non-abuse auth error — reconstruct the response for downstream handling
-        response = new Response(errorBody, { status: response.status, headers: response.headers });
+        if (isTokenDeadError(errorBody)) {
+          console.error(
+            `[proxy] TOKEN DEAD — pausing token #${resolved.tokenIndex}: ${errorBody.slice(0, 300)}`,
+          );
+          // Pause the token (not the consumer) — provider's subscription likely suspended
+          await pauseDeadToken(env, resolved.tokenIndex, response.status, errorBody);
+          // Ops alert
+          ctx.waitUntil(sendTokenDeadAlert(env, {
+            consumerPoolKey: apiKey,
+            teamId: poolUser.team_id,
+            tokenIndex: resolved.tokenIndex,
+            anthropicStatus: response.status,
+            anthropicError: errorBody.slice(0, 500),
+          }));
+          // Fall through to rotation below — don't return the raw Anthropic error
+          response = new Response(errorBody, { status: response.status, headers: response.headers });
+        } else {
+          // Non-abuse, non-dead auth error — reconstruct for downstream handling
+          response = new Response(errorBody, { status: response.status, headers: response.headers });
+        }
       }
 
-      // Trial users: no pool rotation, but try NVIDIA fallback
+      // Trial users: no pool rotation, return the error as-is
       if (isTrialToken) {
-        const nvidiaFallbackResponse = await attemptNvidiaFallback(bodyBytes, apiKey, poolUser, billingStub, env, ctx);
-        if (nvidiaFallbackResponse) return nvidiaFallbackResponse;
         return response;
       }
       const fallback = isOwnToken
@@ -158,12 +180,6 @@ export async function handleProxyRequest(request, url, env, ctx) {
         response = await forwardToAnthropic(request, url, fallback.token.oauth_token, bodyBytes, env, fallback.token.region);
         return handleResponse(response, fallback.tokenIndex, apiKey, poolUser, env, ctx, false, false, billingStub, requestedModelFamily);
       }
-    }
-
-    // If Anthropic response is still not OK after retries, attempt NVIDIA fallback
-    if (!response.ok) {
-      const nvidiaFallbackResponse = await attemptNvidiaFallback(bodyBytes, apiKey, poolUser, billingStub, env, ctx);
-      if (nvidiaFallbackResponse) return nvidiaFallbackResponse;
     }
 
     return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub, requestedModelFamily);
@@ -189,8 +205,23 @@ const TOKEN_KILLING_PATTERNS = [
   /access.{0,20}(revoked|terminated|suspended)/i,
 ];
 
+/**
+ * Token-dead patterns: the provider's token is unusable (e.g. suspended Max
+ * subscription, OAuth revoked at org level) but the consumer didn't cause it.
+ * Pause the token + ops alert + rotate — don't block the consumer.
+ */
+const TOKEN_DEAD_PATTERNS = [
+  /OAuth authentication is currently not allowed/i,
+  /not have access to Claude/i,
+  /organization.{0,30}(suspended|disabled|restricted)/i,
+];
+
 function isTokenKillingError(errorBody) {
   return TOKEN_KILLING_PATTERNS.some((pattern) => pattern.test(errorBody));
+}
+
+function isTokenDeadError(errorBody) {
+  return TOKEN_DEAD_PATTERNS.some((pattern) => pattern.test(errorBody));
 }
 
 /**
@@ -240,6 +271,59 @@ async function sendAbuseAlert(env, { consumerPoolKey, teamId, tokenIndex, anthro
     tokenIndex,
     anthropicStatus,
     anthropicError,
+  });
+}
+
+/**
+ * Pause a dead token (provider subscription suspended, OAuth revoked at org level, etc.).
+ * Only pauses the token — does NOT block the consumer.
+ */
+async function pauseDeadToken(env, tokenIndex, anthropicStatus, errorBody) {
+  const tokenRecord = await env.POOL.get(`token:${tokenIndex}`, "json");
+  if (tokenRecord && tokenRecord.enabled !== false) {
+    tokenRecord.enabled = false;
+    tokenRecord.paused_at = new Date().toISOString();
+    tokenRecord.paused_reason = `auto-paused: provider token dead (Anthropic ${anthropicStatus}): ${errorBody.slice(0, 200)}`;
+    await env.POOL.put(`token:${tokenIndex}`, JSON.stringify(tokenRecord));
+  }
+}
+
+/**
+ * Fire-and-forget: send ops alert when a provider token dies.
+ */
+async function sendTokenDeadAlert(env, { consumerPoolKey, teamId, tokenIndex, anthropicStatus, anthropicError }) {
+  // Look up provider email for the dead token
+  const tokenRecord = await env.POOL.get(`token:${tokenIndex}`, "json");
+  let providerEmail = null;
+  if (tokenRecord?.provider_google_id) {
+    const googleUser = await env.POOL.get(`google_user:${tokenRecord.provider_google_id}`, "json");
+    providerEmail = googleUser?.email;
+  }
+
+  // Look up consumer email
+  let consumerEmail = null;
+  const poolKeyRecord = await env.POOL.get(`poolkey:${consumerPoolKey}`, "json");
+  if (poolKeyRecord?.google_id) {
+    const googleUser = await env.POOL.get(`google_user:${poolKeyRecord.google_id}`, "json");
+    consumerEmail = googleUser?.email;
+  }
+
+  const { sendEmail } = await import("./email.js");
+  await sendEmail(env, {
+    to: env.ADMIN_EMAIL,
+    subject: `Token #${tokenIndex} dead — auto-paused`,
+    body: [
+      `Token #${tokenIndex} (${tokenRecord?.label || "unknown"}) returned Anthropic ${anthropicStatus} and has been auto-paused.`,
+      "",
+      `Provider: ${providerEmail || "unknown"}`,
+      `Consumer at time of error: ${consumerEmail || "unknown"} (team ${teamId})`,
+      "",
+      `Anthropic error:`,
+      anthropicError,
+      "",
+      `Action: the token has been removed from rotation. The consumer was NOT blocked.`,
+      `The provider needs to re-authorize their token once their subscription is restored.`,
+    ].join("\n"),
   });
 }
 
@@ -444,6 +528,20 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
 }
 
 /**
+ * Detect OpenClaw heartbeat requests by matching the default heartbeat system prompt.
+ * These fire every 30 minutes and burn ~20K tokens each for a no-op check.
+ */
+function isHeartbeatRequest(bodyBytes) {
+  if (!bodyBytes) return false;
+  try {
+    const text = new TextDecoder().decode(bodyBytes.slice(0, 2000));
+    return /Read HEARTBEAT\.md/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Extract the model family (opus, sonnet, haiku) from raw request body bytes.
  * Regex on the raw string — no JSON parsing needed.
  */
@@ -525,174 +623,6 @@ function extractRateLimits(response) {
   if (overageStatus) limits.unified_overage_status = overageStatus;
 
   return Object.keys(limits).length > 0 ? limits : null;
-}
-
-// ---------------------------------------------------------------------------
-// NVIDIA fallback — transparent fallback to NVIDIA when Anthropic is unavailable
-// ---------------------------------------------------------------------------
-
-const NVIDIA_UPSTREAM = "https://integrate.api.nvidia.com";
-const MAX_NVIDIA_FALLBACK_RETRIES = 2;
-
-/**
- * Attempt to fulfill an Anthropic-format request via NVIDIA when Claude is unavailable.
- * Translates Anthropic → OpenAI, sends to NVIDIA, translates response back → Anthropic.
- * Returns null if fallback is not possible (no NVIDIA tokens, NVIDIA also fails, etc.).
- */
-async function attemptNvidiaFallback(bodyBytes, apiKey, poolUser, billingStub, env, ctx) {
-  if (!bodyBytes) return null;
-
-  let anthropicBody;
-  try {
-    anthropicBody = JSON.parse(new TextDecoder().decode(bodyBytes));
-  } catch {
-    return null;
-  }
-
-  // Only fall back for actual message requests (not count_tokens, etc.)
-  if (!anthropicBody.messages) return null;
-
-  const originalModel = anthropicBody.model || "claude-sonnet-4-5-20250929";
-  const resolvedModel = await resolveAutoModel(env);
-  const openaiBody = translateAnthropicRequestToOpenai(anthropicBody, resolvedModel);
-
-  const hash = await sessionId(apiKey);
-  const resolved = await resolveToken(hash, env, "nvidia");
-  if (!resolved) return null;
-
-  // Forward to NVIDIA with retry logic (same pattern as nvidia-proxy.js)
-  let response = await forwardToNvidiaFallback(resolved.token.api_key, openaiBody);
-  let currentTokenIndex = resolved.tokenIndex;
-  let retries = 0;
-
-  while (!response.ok && retries < MAX_NVIDIA_FALLBACK_RETRIES) {
-    const status = response.status;
-
-    ctx.waitUntil(updateNvidiaTokenHealth(currentTokenIndex, false, status, env));
-
-    if (status === 429) {
-      const rotated = await rotateToken(hash, currentTokenIndex, env, "nvidia");
-      if (!rotated) break;
-      currentTokenIndex = rotated.tokenIndex;
-      response = await forwardToNvidiaFallback(rotated.token.api_key, openaiBody);
-    } else if (status >= 500) {
-      if (retries === 0) {
-        response = await forwardToNvidiaFallback(resolved.token.api_key, openaiBody);
-      } else {
-        const rotated = await rotateToken(hash, currentTokenIndex, env, "nvidia");
-        if (!rotated) break;
-        currentTokenIndex = rotated.tokenIndex;
-        response = await forwardToNvidiaFallback(rotated.token.api_key, openaiBody);
-      }
-    } else {
-      break;
-    }
-
-    retries++;
-  }
-
-  ctx.waitUntil(updateNvidiaTokenHealth(currentTokenIndex, response.ok, response.status, env));
-
-  if (!response.ok) return null;
-
-  console.log(`[proxy] NVIDIA fallback activated — model=${resolvedModel} nvidia_token=${currentTokenIndex} retries=${retries}`);
-
-  const contentType = response.headers.get("content-type") || "";
-
-  if (contentType.includes("text/event-stream")) {
-    // Streaming: pipe through OpenAI→Anthropic translation stream
-    let usageResolve;
-    const usagePromise = new Promise((resolve) => { usageResolve = resolve; });
-    const translatedBody = response.body.pipeThrough(
-      createOpenaiToAnthropicStream(originalModel, (usage) => usageResolve(usage)),
-    );
-
-    ctx.waitUntil(
-      usagePromise.then(async (usage) => {
-        if (usage && (usage.input_tokens > 0 || usage.output_tokens > 0)) {
-          const normalizedUsage = {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-          };
-          const billableTokens = totalTokens(normalizedUsage);
-          const kvTeamKey = poolUser.team_id ? `team:${poolUser.team_id}` : null;
-          const kvSeatKey = `poolkey:${apiKey}`;
-          const [deductResult] = await Promise.all([
-            billingStub.fetch(new Request("https://do/deduct", {
-              method: "POST",
-              body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey, teamId: poolUser.team_id }),
-            })).then((deductResponse) => deductResponse.json()),
-            updateNvidiaUsage(currentTokenIndex, normalizedUsage, env),
-            recordNvidiaUsage(apiKey, currentTokenIndex, normalizedUsage, env),
-          ]);
-          if (deductResult.alertThreshold) {
-            await checkUsageThresholds(apiKey, env).catch(() => {});
-          }
-        }
-      }),
-    );
-
-    return new Response(translatedBody, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
-    });
-  } else {
-    // Non-streaming: translate OpenAI JSON → Anthropic JSON
-    const openaiResponse = await response.json();
-    const anthropicResponse = translateOpenaiResponseToAnthropic(openaiResponse, originalModel);
-
-    ctx.waitUntil((async () => {
-      if (openaiResponse.usage) {
-        const normalizedUsage = {
-          input_tokens: openaiResponse.usage.prompt_tokens || 0,
-          output_tokens: openaiResponse.usage.completion_tokens || 0,
-          cache_read_tokens: 0,
-          cache_creation_tokens: 0,
-        };
-        const billableTokens = totalTokens(normalizedUsage);
-        const kvTeamKey = poolUser.team_id ? `team:${poolUser.team_id}` : null;
-        const kvSeatKey = `poolkey:${apiKey}`;
-        const [deductResult] = await Promise.all([
-          billingStub.fetch(new Request("https://do/deduct", {
-            method: "POST",
-            body: JSON.stringify({ billableTokens, seatKey: apiKey, kvTeamKey, kvSeatKey, teamId: poolUser.team_id }),
-          })).then((deductResponse) => deductResponse.json()),
-          updateNvidiaUsage(currentTokenIndex, normalizedUsage, env),
-          recordNvidiaUsage(apiKey, currentTokenIndex, normalizedUsage, env),
-        ]);
-        if (deductResult.alertThreshold) {
-          await checkUsageThresholds(apiKey, env).catch(() => {});
-        }
-      }
-    })());
-
-    return Response.json(anthropicResponse);
-  }
-}
-
-/**
- * Forward a request to NVIDIA upstream for fallback.
- * Includes a 60-second timeout to prevent hanging.
- */
-function forwardToNvidiaFallback(nvidiaApiKey, body) {
-  const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), 60_000);
-
-  return fetch(`${NVIDIA_UPSTREAM}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${nvidiaApiKey}`,
-    },
-    body: JSON.stringify(body),
-    signal: abortController.signal,
-  }).finally(() => clearTimeout(timeoutId));
 }
 
 // ---------------------------------------------------------------------------
