@@ -59,8 +59,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
           type: "invalid_request_error",
           message: "OpenClaw heartbeat requests are blocked on the Claude pool. "
             + "Heartbeats burn ~20K tokens every 30 minutes for a no-op check. "
-            + "Disable them with heartbeat.every: \"off\" in your OpenClaw config, "
-            + "or set heartbeat.model to a free/cheap model (e.g. NVIDIA). "
+            + "Disable them with heartbeat.every: \"off\" in your OpenClaw config. "
             + "See https://docs.openclaw.ai/gateway/heartbeat",
         },
       }, { status: 400 });
@@ -107,7 +106,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
       }
       if (error.status === 529) {
         ctx.waitUntil(updateStatusAudit(false, env));
-        ctx.waitUntil(sendThrottledCapacityAlert("claude", env));
+        ctx.waitUntil(sendThrottledCapacityAlert(env));
         // Provider with no consumer subscription — upsell the consumer tier
         if (poolUser.provider_key && !(billingRecord.plan_tokens > 0)) {
           ctx.waitUntil(sendProviderCapacityUpsell(poolUser.team_id, env));
