@@ -183,6 +183,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
 
     return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub, requestedModelFamily);
   } catch (proxyError) {
+    console.error("[depth-diag]", JSON.stringify({ cf_ew_via: request.headers.get("cf-ew-via"), cf_connecting_ip: request.headers.get("cf-connecting-ip"), path: url?.pathname, error: proxyError?.message, tokenRegion: typeof resolved !== "undefined" ? resolved?.token?.region ?? null : null }));
     console.error("[handleProxyRequest] Unhandled error:", proxyError?.message || proxyError, proxyError?.stack);
     return Response.json(
       { error: `Proxy error: ${proxyError?.message || "unknown"}` },
