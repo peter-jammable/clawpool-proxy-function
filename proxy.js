@@ -52,9 +52,7 @@ export async function handleProxyRequest(request, url, env, ctx) {
     if (shutdownActive === "1") {
       const allowlistRaw = await env.POOL.get("meta:shutdown_allowed_keys");
       const allowedKeys = allowlistRaw ? JSON.parse(allowlistRaw) : [];
-      const isAdminEmail = poolUser.email && poolUser.email === env.ADMIN_EMAIL;
-      const isAllowedKey = allowedKeys.includes(apiKey);
-      if (!isAdminEmail && !isAllowedKey) {
+      if (!allowedKeys.includes(apiKey)) {
         return Response.json({
           error: "ClawPool has been discontinued due to provider supply issues. Pro-rata refunds are being processed via Stripe. Check your email for details, or contact support@clawpool.ai.",
         }, { status: 503 });
