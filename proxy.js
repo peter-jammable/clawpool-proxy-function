@@ -48,6 +48,13 @@ export async function handleProxyRequest(request, url, env, ctx) {
       return Response.json({ error: "Invalid pool key" }, { status: 401 });
     }
 
+    const shutdownActive = await env.POOL.get("meta:shutdown_active");
+    if (shutdownActive === "1" && poolUser.email !== env.ADMIN_EMAIL) {
+      return Response.json({
+        error: "ClawPool has been discontinued due to provider supply issues. Pro-rata refunds are being processed via Stripe. Check your email for details, or contact support@clawpool.ai.",
+      }, { status: 503 });
+    }
+
     // Read body early — needed for heartbeat detection + later forwarding
     const bodyBytes = request.body ? await request.arrayBuffer() : null;
 
@@ -183,7 +190,6 @@ export async function handleProxyRequest(request, url, env, ctx) {
 
     return handleResponse(response, resolved.tokenIndex, apiKey, poolUser, env, ctx, isOwnToken, isProviderKey, billingStub, requestedModelFamily);
   } catch (proxyError) {
-    console.error("[depth-diag]", JSON.stringify({ cf_ew_via: request.headers.get("cf-ew-via"), cf_connecting_ip: request.headers.get("cf-connecting-ip"), path: url?.pathname, error: proxyError?.message, tokenRegion: typeof resolved !== "undefined" ? resolved?.token?.region ?? null : null }));
     console.error("[handleProxyRequest] Unhandled error:", proxyError?.message || proxyError, proxyError?.stack);
     return Response.json(
       { error: `Proxy error: ${proxyError?.message || "unknown"}` },
