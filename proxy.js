@@ -518,7 +518,11 @@ async function resolveAuthorizedToken(apiKey, poolUser, billingRecord, env, doEx
     if (resolved) isOwnToken = true;
   }
 
-  const canUsePool = !isProviderPoolKey || (billingRecord.plan_tokens > 0 && !subscriptionExhausted);
+  // Provider pool keys route only through the provider's own tokens. When
+  // every own token is over the leasing cutoff / outside active hours /
+  // disabled, refuse the request — don't fall through to other providers'
+  // pool tokens. The leasing cutoff applies to the provider too.
+  const canUsePool = !isProviderPoolKey;
   if (!resolved && canUsePool) {
     resolved = await resolveToken(await sessionId(apiKey), env);
   }
